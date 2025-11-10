@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target
+/debug
+/release
+
+# Cargo.lock for libraries (uncomment for binaries)
+# Cargo.lock
+
+# Rust/Cargo files
+**/*.rs.bk
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Flamegraph profiling
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Benchmark results
+criterion/
+
+# Test coverage
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+cobertura.xml
+
+# Local development
+.env
+*.log
+tmp/
