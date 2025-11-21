@@ -320,6 +320,347 @@ impl Ord for Value {
     }
 }
 
+/// Convert a `T` into `Value` which is an enum that can represent any valid CBOR data.
+///
+/// This conversion can fail if `T`'s implementation of `Serialize` decides to
+/// fail, or if `T` contains a map with non-string keys.
+///
+/// Note: Due to how serde works, `Some(x)` will serialize as just `x`, and `None` as `Null`.
+/// This means you cannot distinguish between `Some(T)` and `T` in the resulting `Value`.
+pub fn to_value<T>(value: T) -> Result<Value, crate::Error>
+where
+    T: Serialize,
+{
+    value.serialize(ValueSerializer)
+}
+
+struct ValueSerializer;
+
+impl Serializer for ValueSerializer {
+    type Ok = Value;
+    type Error = crate::Error;
+    
+    type SerializeSeq = SerializeVec;
+    type SerializeTuple = SerializeVec;
+    type SerializeTupleStruct = SerializeVec;
+    type SerializeTupleVariant = SerializeTupleVariant;
+    type SerializeMap = SerializeMap;
+    type SerializeStruct = SerializeMap;
+    type SerializeStructVariant = SerializeStructVariant;
+
+    fn serialize_bool(self, v: bool) -> Result<Value, crate::Error> {
+        Ok(Value::Bool(v))
+    }
+
+    fn serialize_i8(self, v: i8) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i64))
+    }
+
+    fn serialize_i16(self, v: i16) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i64))
+    }
+
+    fn serialize_i32(self, v: i32) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i64))
+    }
+
+    fn serialize_i64(self, v: i64) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v))
+    }
+
+    fn serialize_u8(self, v: u8) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i64))
+    }
+
+    fn serialize_u16(self, v: u16) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i64))
+    }
+
+    fn serialize_u32(self, v: u32) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i64))
+    }
+
+    fn serialize_u64(self, v: u64) -> Result<Value, crate::Error> {
+        if v <= i64::MAX as u64 {
+            Ok(Value::Integer(v as i64))
+        } else {
+            Err(crate::Error::Message(format!("u64 value {} too large for i64", v)))
+        }
+    }
+
+    fn serialize_f32(self, v: f32) -> Result<Value, crate::Error> {
+        Ok(Value::Float(v as f64))
+    }
+
+    fn serialize_f64(self, v: f64) -> Result<Value, crate::Error> {
+        Ok(Value::Float(v))
+    }
+
+    fn serialize_char(self, v: char) -> Result<Value, crate::Error> {
+        Ok(Value::Text(v.to_string()))
+    }
+
+    fn serialize_str(self, v: &str) -> Result<Value, crate::Error> {
+        Ok(Value::Text(v.to_string()))
+    }
+
+    fn serialize_bytes(self, v: &[u8]) -> Result<Value, crate::Error> {
+        Ok(Value::Bytes(v.to_vec()))
+    }
+
+    fn serialize_none(self) -> Result<Value, crate::Error> {
+        Ok(Value::Null)
+    }
+
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Value, crate::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_unit(self) -> Result<Value, crate::Error> {
+        Ok(Value::Null)
+    }
+
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value, crate::Error> {
+        Ok(Value::Null)
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Value, crate::Error> {
+        Ok(Value::Text(variant.to_string()))
+    }
+
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<Value, crate::Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> Result<Value, crate::Error> {
+        let mut map = BTreeMap::new();
+        map.insert(Value::Text(variant.to_string()), value.serialize(ValueSerializer)?);
+        Ok(Value::Map(map))
+    }
+
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, crate::Error> {
+        Ok(SerializeVec { vec: Vec::new() })
+    }
+
+    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, crate::Error> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeTupleStruct, crate::Error> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleVariant, crate::Error> {
+        Ok(SerializeTupleVariant {
+            name: variant.to_string(),
+            vec: Vec::new(),
+        })
+    }
+
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, crate::Error> {
+        Ok(SerializeMap {
+            map: BTreeMap::new(),
+            next_key: None,
+        })
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<Self::SerializeStruct, crate::Error> {
+        self.serialize_map(Some(len))
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStructVariant, crate::Error> {
+        Ok(SerializeStructVariant {
+            name: variant.to_string(),
+            map: BTreeMap::new(),
+        })
+    }
+}
+
+struct SerializeVec {
+    vec: Vec<Value>,
+}
+
+impl serde::ser::SerializeSeq for SerializeVec {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
+        self.vec.push(value.serialize(ValueSerializer)?);
+        Ok(())
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        Ok(Value::Array(self.vec))
+    }
+}
+
+impl serde::ser::SerializeTuple for SerializeVec {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl serde::ser::SerializeTupleStruct for SerializeVec {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+struct SerializeTupleVariant {
+    name: String,
+    vec: Vec<Value>,
+}
+
+impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
+        self.vec.push(value.serialize(ValueSerializer)?);
+        Ok(())
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        let mut map = BTreeMap::new();
+        map.insert(Value::Text(self.name), Value::Array(self.vec));
+        Ok(Value::Map(map))
+    }
+}
+
+struct SerializeMap {
+    map: BTreeMap<Value, Value>,
+    next_key: Option<Value>,
+}
+
+impl serde::ser::SerializeMap for SerializeMap {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), crate::Error> {
+        self.next_key = Some(key.serialize(ValueSerializer)?);
+        Ok(())
+    }
+
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
+        let key = self.next_key.take().ok_or_else(|| {
+            crate::Error::Message("serialize_value called before serialize_key".to_string())
+        })?;
+        self.map.insert(key, value.serialize(ValueSerializer)?);
+        Ok(())
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        Ok(Value::Map(self.map))
+    }
+}
+
+impl serde::ser::SerializeStruct for SerializeMap {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), crate::Error> {
+        serde::ser::SerializeMap::serialize_entry(self, key, value)
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        serde::ser::SerializeMap::end(self)
+    }
+}
+
+struct SerializeStructVariant {
+    name: String,
+    map: BTreeMap<Value, Value>,
+}
+
+impl serde::ser::SerializeStructVariant for SerializeStructVariant {
+    type Ok = Value;
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), crate::Error> {
+        self.map.insert(
+            Value::Text(key.to_string()),
+            value.serialize(ValueSerializer)?,
+        );
+        Ok(())
+    }
+
+    fn end(self) -> Result<Value, crate::Error> {
+        let mut outer_map = BTreeMap::new();
+        outer_map.insert(Value::Text(self.name), Value::Map(self.map));
+        Ok(Value::Map(outer_map))
+    }
+}
+
+/// Interpret a `Value` as an instance of type `T`.
+///
+/// This conversion can fail if the structure of the `Value` does not match the
+/// structure expected by `T`, for example if `T` is a struct type but the
+/// `Value` contains something other than a CBOR map.
+pub fn from_value<T>(value: Value) -> Result<T, crate::Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = crate::to_vec(&value)?;
+    crate::from_slice(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
