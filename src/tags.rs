@@ -1,5 +1,5 @@
-use serde::{Deserialize, Deserializer, Serialize};
 use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -127,7 +127,9 @@ where
                     }),
                     Err(_) => {
                         // If deserializing as TaggedHelper fails, try deserializing as T directly
-                        Err(de::Error::custom("expected tagged value structure or plain value"))
+                        Err(de::Error::custom(
+                            "expected tagged value structure or plain value",
+                        ))
                     }
                 }
             }
@@ -148,7 +150,7 @@ mod tests {
         // From JSON: plain string should deserialize to Tagged with no tag
         let json = r#""https://example.com""#;
         let tagged: Tagged<String> = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(tagged.tag, None);
         assert_eq!(tagged.value, "https://example.com");
     }
@@ -158,7 +160,7 @@ mod tests {
         // From JSON: object with tag and value fields
         let json = r#"{"tag": 32, "value": "https://example.com"}"#;
         let tagged: Tagged<String> = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(tagged.tag, Some(32));
         assert_eq!(tagged.value, "https://example.com");
     }
@@ -169,7 +171,7 @@ mod tests {
         let tagged_original = Tagged::new(Some(32), "https://example.com".to_string());
         let cbor = crate::to_vec(&tagged_original).unwrap();
         let tagged_decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
-        
+
         assert_eq!(tagged_decoded.tag, Some(32));
         assert_eq!(tagged_decoded.value, "https://example.com");
     }
@@ -179,7 +181,7 @@ mod tests {
         // From JSON: plain number
         let json = r#"42"#;
         let tagged: Tagged<u32> = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(tagged.tag, None);
         assert_eq!(tagged.value, 42);
     }

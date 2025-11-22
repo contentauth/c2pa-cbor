@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub mod value;
-pub use value::{Value, to_value, from_value};
+pub use value::{Value, from_value, to_value};
 
 pub mod tags;
 pub use tags::Tagged;
@@ -369,11 +369,14 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
         self.serialize_str(variant)
     }
 
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        value: &T,
-    ) -> Result<()> {
+    fn serialize_newtype_struct<T: ?Sized>(self, _name: &'static str, value: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        // Serialize as a 1-element array to maintain tuple struct semantics
+        // This allows tuple structs like `struct Wrapper(Inner)` to round-trip correctly
+        // Users can override with #[serde(transparent)] if they want the inner value directly
+        self.write_type_value(MAJOR_ARRAY, 1)?;
         value.serialize(self)
     }
 
@@ -587,7 +590,10 @@ pub struct Decoder<R: Read> {
 
 impl<R: Read> Decoder<R> {
     pub fn new(reader: R) -> Self {
-        Decoder { reader, peeked: None }
+        Decoder {
+            reader,
+            peeked: None,
+        }
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -663,7 +669,9 @@ impl<R: Read> Decoder<R> {
 
         match self.read_length(info)? {
             Some(tag) => Ok(tag),
-            None => Err(Error::Syntax("Tag cannot have indefinite length".to_string())),
+            None => Err(Error::Syntax(
+                "Tag cannot have indefinite length".to_string(),
+            )),
         }
     }
 
@@ -685,58 +693,59 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
     fn deserialize_option<V: serde::de::Visitor<'de>>(mut self, visitor: V) -> Result<V::Value> {
         // Peek at next byte to check for null
         let initial = self.read_u8()?;
-        if initial == 0xf6 { // CBOR null
+        if initial == 0xf6 {
+            // CBOR null
             visitor.visit_none()
         } else {
             // Not null - need to process this byte as part of Some(...)
             // Put it back and deserialize
             let major = initial >> 5;
             let info = initial & 0x1f;
-            
+
             // Create a temporary deserializer state with this byte already read
             struct OptionDeserializer<'a, R: Read> {
                 decoder: &'a mut Decoder<R>,
                 initial_major: u8,
                 initial_info: u8,
             }
-            
+
             impl<'de, 'a, R: Read> serde::Deserializer<'de> for OptionDeserializer<'a, R> {
                 type Error = crate::Error;
-                
-                fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+
+                fn deserialize_any<V: serde::de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> Result<V::Value> {
                     // Process using the already-read byte
                     match self.initial_major {
-                        MAJOR_MAP => {
-                            match self.decoder.read_length(self.initial_info)? {
-                                Some(len) => {
-                                    visitor.visit_map(MapAccess {
-                                        de: self.decoder,
-                                        remaining: Some(len as usize),
-                                    })
-                                }
-                                None => {
-                                    visitor.visit_map(MapAccess {
-                                        de: self.decoder,
-                                        remaining: None,
-                                    })
-                                }
-                            }
-                        }
+                        MAJOR_MAP => match self.decoder.read_length(self.initial_info)? {
+                            Some(len) => visitor.visit_map(MapAccess {
+                                de: self.decoder,
+                                remaining: Some(len as usize),
+                            }),
+                            None => visitor.visit_map(MapAccess {
+                                de: self.decoder,
+                                remaining: None,
+                            }),
+                        },
                         _ => {
                             // For other types, just delegate to decoder's deserialize_any
                             // but we've already consumed the byte, so reconstruct the value
-                            Err(Error::Syntax("Option deserialization only supports maps and simple types".to_string()))
+                            Err(Error::Syntax(
+                                "Option deserialization only supports maps and simple types"
+                                    .to_string(),
+                            ))
                         }
                     }
                 }
-                
+
                 serde::forward_to_deserialize_any! {
                     bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
                     bytes byte_buf option unit unit_struct newtype_struct seq tuple
                     tuple_struct map struct enum identifier ignored_any
                 }
             }
-            
+
             visitor.visit_some(OptionDeserializer {
                 decoder: &mut self,
                 initial_major: major,
@@ -752,11 +761,15 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
 
         match major {
             MAJOR_UNSIGNED => {
-                let val = self.read_length(info)?.ok_or_else(|| Error::Syntax("Unsigned integer cannot be indefinite".to_string()))?;
+                let val = self.read_length(info)?.ok_or_else(|| {
+                    Error::Syntax("Unsigned integer cannot be indefinite".to_string())
+                })?;
                 visitor.visit_u64(val)
             }
             MAJOR_NEGATIVE => {
-                let val = self.read_length(info)?.ok_or_else(|| Error::Syntax("Negative integer cannot be indefinite".to_string()))?;
+                let val = self.read_length(info)?.ok_or_else(|| {
+                    Error::Syntax("Negative integer cannot be indefinite".to_string())
+                })?;
                 visitor.visit_i64(-1 - val as i64)
             }
             MAJOR_BYTES => {
@@ -779,9 +792,17 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                             let major = initial >> 5;
                             let info = initial & 0x1f;
                             if major != MAJOR_BYTES {
-                                return Err(Error::Syntax("Indefinite byte string chunks must be byte strings".to_string()));
+                                return Err(Error::Syntax(
+                                    "Indefinite byte string chunks must be byte strings"
+                                        .to_string(),
+                                ));
                             }
-                            let len = self.read_length(info)?.ok_or_else(|| Error::Syntax("Indefinite byte string chunks cannot be indefinite".to_string()))?;
+                            let len = self.read_length(info)?.ok_or_else(|| {
+                                Error::Syntax(
+                                    "Indefinite byte string chunks cannot be indefinite"
+                                        .to_string(),
+                                )
+                            })?;
                             let mut chunk = vec![0u8; len as usize];
                             self.reader.read_exact(&mut chunk)?;
                             result.extend_from_slice(&chunk);
@@ -811,53 +832,52 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                             let major = initial >> 5;
                             let info = initial & 0x1f;
                             if major != MAJOR_TEXT {
-                                return Err(Error::Syntax("Indefinite text string chunks must be text strings".to_string()));
+                                return Err(Error::Syntax(
+                                    "Indefinite text string chunks must be text strings"
+                                        .to_string(),
+                                ));
                             }
-                            let len = self.read_length(info)?.ok_or_else(|| Error::Syntax("Indefinite text string chunks cannot be indefinite".to_string()))?;
+                            let len = self.read_length(info)?.ok_or_else(|| {
+                                Error::Syntax(
+                                    "Indefinite text string chunks cannot be indefinite"
+                                        .to_string(),
+                                )
+                            })?;
                             let mut chunk_buf = vec![0u8; len as usize];
                             self.reader.read_exact(&mut chunk_buf)?;
-                            let chunk = String::from_utf8(chunk_buf).map_err(|_| Error::InvalidUtf8)?;
+                            let chunk =
+                                String::from_utf8(chunk_buf).map_err(|_| Error::InvalidUtf8)?;
                             result.push_str(&chunk);
                         }
                         visitor.visit_string(result)
                     }
                 }
             }
-            MAJOR_ARRAY => {
-                match self.read_length(info)? {
-                    Some(len) => {
-                        visitor.visit_seq(SeqAccess {
-                            de: &mut self,
-                            remaining: Some(len as usize),
-                        })
-                    }
-                    None => {
-                        visitor.visit_seq(SeqAccess {
-                            de: &mut self,
-                            remaining: None,
-                        })
-                    }
-                }
-            }
-            MAJOR_MAP => {
-                match self.read_length(info)? {
-                    Some(len) => {
-                        visitor.visit_map(MapAccess {
-                            de: &mut self,
-                            remaining: Some(len as usize),
-                        })
-                    }
-                    None => {
-                        visitor.visit_map(MapAccess {
-                            de: &mut self,
-                            remaining: None,
-                        })
-                    }
-                }
-            }
+            MAJOR_ARRAY => match self.read_length(info)? {
+                Some(len) => visitor.visit_seq(SeqAccess {
+                    de: &mut self,
+                    remaining: Some(len as usize),
+                }),
+                None => visitor.visit_seq(SeqAccess {
+                    de: &mut self,
+                    remaining: None,
+                }),
+            },
+            MAJOR_MAP => match self.read_length(info)? {
+                Some(len) => visitor.visit_map(MapAccess {
+                    de: &mut self,
+                    remaining: Some(len as usize),
+                }),
+                None => visitor.visit_map(MapAccess {
+                    de: &mut self,
+                    remaining: None,
+                }),
+            },
             MAJOR_TAG => {
                 // Read the tag number
-                let _tag = self.read_length(info)?.ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
+                let _tag = self
+                    .read_length(info)?
+                    .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
                 // For now, just deserialize the tagged content
                 // The tag information is available but we pass through to the content
                 self.deserialize_any(visitor)
@@ -896,7 +916,9 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
         match major {
             MAJOR_TEXT => {
                 // Unit variant encoded as string
-                let len = self.read_length(info)?.ok_or_else(|| Error::Syntax("Enum variant cannot be indefinite length".to_string()))?;
+                let len = self.read_length(info)?.ok_or_else(|| {
+                    Error::Syntax("Enum variant cannot be indefinite length".to_string())
+                })?;
                 let mut buf = vec![0u8; len as usize];
                 self.reader.read_exact(&mut buf)?;
                 let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
@@ -906,7 +928,9 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                 // Variant with data encoded as {"variant": data}
                 let len = self.read_length(info)?;
                 if len != Some(1) {
-                    return Err(Error::Syntax("Enum variant with data must be single-entry map".to_string()));
+                    return Err(Error::Syntax(
+                        "Enum variant with data must be single-entry map".to_string(),
+                    ));
                 }
                 visitor.visit_enum(VariantAccess { de: &mut self })
             }
@@ -930,46 +954,34 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         if initial == 0xf6 {
             return visitor.visit_none();
         }
-        
+
         // Not null - process as Some(...)
         // We've already read the initial byte, so handle it inline
         let major = initial >> 5;
         let info = initial & 0x1f;
-        
+
         // Handle the value based on major type
         match major {
-            MAJOR_MAP => {
-                match self.read_length(info)? {
-                    Some(len) => {
-                        visitor.visit_some(MapDeserializer {
-                            de: self,
-                            remaining: Some(len as usize),
-                        })
-                    }
-                    None => {
-                        visitor.visit_some(MapDeserializer {
-                            de: self,
-                            remaining: None,
-                        })
-                    }
-                }
-            }
-            MAJOR_ARRAY => {
-                match self.read_length(info)? {
-                    Some(len) => {
-                        visitor.visit_some(ArrayDeserializer {
-                            de: self,
-                            remaining: Some(len as usize),
-                        })
-                    }
-                    None => {
-                        visitor.visit_some(ArrayDeserializer {
-                            de: self,
-                            remaining: None,
-                        })
-                    }
-                }
-            }
+            MAJOR_MAP => match self.read_length(info)? {
+                Some(len) => visitor.visit_some(MapDeserializer {
+                    de: self,
+                    remaining: Some(len as usize),
+                }),
+                None => visitor.visit_some(MapDeserializer {
+                    de: self,
+                    remaining: None,
+                }),
+            },
+            MAJOR_ARRAY => match self.read_length(info)? {
+                Some(len) => visitor.visit_some(ArrayDeserializer {
+                    de: self,
+                    remaining: Some(len as usize),
+                }),
+                None => visitor.visit_some(ArrayDeserializer {
+                    de: self,
+                    remaining: None,
+                }),
+            },
             _ => {
                 // For simple types, deserialize directly
                 // We need to recreate the deserialization with the byte we already read
@@ -982,18 +994,22 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         }
     }
 
-    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+    fn deserialize_any<V: serde::de::Visitor<'de>>(mut self, visitor: V) -> Result<V::Value> {
         let initial = self.read_u8()?;
         let major = initial >> 5;
         let info = initial & 0x1f;
 
         match major {
             MAJOR_UNSIGNED => {
-                let val = self.read_length(info)?.ok_or_else(|| Error::Syntax("Unsigned integer cannot be indefinite".to_string()))?;
+                let val = self.read_length(info)?.ok_or_else(|| {
+                    Error::Syntax("Unsigned integer cannot be indefinite".to_string())
+                })?;
                 visitor.visit_u64(val)
             }
             MAJOR_NEGATIVE => {
-                let val = self.read_length(info)?.ok_or_else(|| Error::Syntax("Negative integer cannot be indefinite".to_string()))?;
+                let val = self.read_length(info)?.ok_or_else(|| {
+                    Error::Syntax("Negative integer cannot be indefinite".to_string())
+                })?;
                 visitor.visit_i64(-1 - val as i64)
             }
             MAJOR_BYTES => {
@@ -1016,9 +1032,17 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                             let major = initial >> 5;
                             let info = initial & 0x1f;
                             if major != MAJOR_BYTES {
-                                return Err(Error::Syntax("Indefinite byte string chunks must be byte strings".to_string()));
+                                return Err(Error::Syntax(
+                                    "Indefinite byte string chunks must be byte strings"
+                                        .to_string(),
+                                ));
                             }
-                            let len = self.read_length(info)?.ok_or_else(|| Error::Syntax("Indefinite byte string chunks cannot be indefinite".to_string()))?;
+                            let len = self.read_length(info)?.ok_or_else(|| {
+                                Error::Syntax(
+                                    "Indefinite byte string chunks cannot be indefinite"
+                                        .to_string(),
+                                )
+                            })?;
                             let mut chunk = vec![0u8; len as usize];
                             self.reader.read_exact(&mut chunk)?;
                             result.extend_from_slice(&chunk);
@@ -1048,53 +1072,52 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                             let major = initial >> 5;
                             let info = initial & 0x1f;
                             if major != MAJOR_TEXT {
-                                return Err(Error::Syntax("Indefinite text string chunks must be text strings".to_string()));
+                                return Err(Error::Syntax(
+                                    "Indefinite text string chunks must be text strings"
+                                        .to_string(),
+                                ));
                             }
-                            let len = self.read_length(info)?.ok_or_else(|| Error::Syntax("Indefinite text string chunks cannot be indefinite".to_string()))?;
+                            let len = self.read_length(info)?.ok_or_else(|| {
+                                Error::Syntax(
+                                    "Indefinite text string chunks cannot be indefinite"
+                                        .to_string(),
+                                )
+                            })?;
                             let mut chunk_buf = vec![0u8; len as usize];
                             self.reader.read_exact(&mut chunk_buf)?;
-                            let chunk = String::from_utf8(chunk_buf).map_err(|_| Error::InvalidUtf8)?;
+                            let chunk =
+                                String::from_utf8(chunk_buf).map_err(|_| Error::InvalidUtf8)?;
                             result.push_str(&chunk);
                         }
                         visitor.visit_string(result)
                     }
                 }
             }
-            MAJOR_ARRAY => {
-                match self.read_length(info)? {
-                    Some(len) => {
-                        visitor.visit_seq(SeqAccess {
-                            de: self,
-                            remaining: Some(len as usize),
-                        })
-                    }
-                    None => {
-                        visitor.visit_seq(SeqAccess {
-                            de: self,
-                            remaining: None,
-                        })
-                    }
-                }
-            }
-            MAJOR_MAP => {
-                match self.read_length(info)? {
-                    Some(len) => {
-                        visitor.visit_map(MapAccess {
-                            de: self,
-                            remaining: Some(len as usize),
-                        })
-                    }
-                    None => {
-                        visitor.visit_map(MapAccess {
-                            de: self,
-                            remaining: None,
-                        })
-                    }
-                }
-            }
+            MAJOR_ARRAY => match self.read_length(info)? {
+                Some(len) => visitor.visit_seq(SeqAccess {
+                    de: &mut self,
+                    remaining: Some(len as usize),
+                }),
+                None => visitor.visit_seq(SeqAccess {
+                    de: &mut self,
+                    remaining: None,
+                }),
+            },
+            MAJOR_MAP => match self.read_length(info)? {
+                Some(len) => visitor.visit_map(MapAccess {
+                    de: &mut self,
+                    remaining: Some(len as usize),
+                }),
+                None => visitor.visit_map(MapAccess {
+                    de: &mut self,
+                    remaining: None,
+                }),
+            },
             MAJOR_TAG => {
                 // Read the tag number
-                let _tag = self.read_length(info)?.ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
+                let _tag = self
+                    .read_length(info)?
+                    .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
                 // For now, just deserialize the tagged content
                 // The tag information is available but we pass through to the content
                 self.deserialize_any(visitor)
@@ -1133,7 +1156,9 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         match major {
             MAJOR_TEXT => {
                 // Unit variant encoded as string
-                let len = self.read_length(info)?.ok_or_else(|| Error::Syntax("Enum variant cannot be indefinite length".to_string()))?;
+                let len = self.read_length(info)?.ok_or_else(|| {
+                    Error::Syntax("Enum variant cannot be indefinite length".to_string())
+                })?;
                 let mut buf = vec![0u8; len as usize];
                 self.reader.read_exact(&mut buf)?;
                 let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
@@ -1143,7 +1168,9 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                 // Variant with data encoded as {"variant": data}
                 let len = self.read_length(info)?;
                 if len != Some(1) {
-                    return Err(Error::Syntax("Enum variant with data must be single-entry map".to_string()));
+                    return Err(Error::Syntax(
+                        "Enum variant with data must be single-entry map".to_string(),
+                    ));
                 }
                 visitor.visit_enum(VariantAccess { de: self })
             }
@@ -1151,9 +1178,80 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         }
     }
 
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value> {
+        // For backward compatibility, we need to handle both:
+        // 1. NEW format: [inner_value] - 1-element array (proper tuple struct encoding)
+        // 2. OLD format: inner_value - direct value (legacy transparent behavior)
+        //
+        // Strategy: Peek at the next byte to determine the format
+        let initial = self.read_u8()?;
+        let major = initial >> 5;
+        let info = initial & 0x1f;
+
+        if major == MAJOR_ARRAY {
+            // NEW format: array wrapping - deserialize as sequence
+            match self.read_length(info)? {
+                Some(1) => {
+                    // 1-element array - extract the single element
+                    visitor.visit_newtype_struct(&mut *self)
+                }
+                Some(len) => {
+                    // Wrong array length for newtype struct
+                    Err(Error::Syntax(format!(
+                        "Expected 1-element array for newtype struct, got {} elements",
+                        len
+                    )))
+                }
+                None => {
+                    // Indefinite-length array not supported for newtype struct
+                    Err(Error::Syntax(
+                        "Indefinite-length array not supported for newtype struct".to_string(),
+                    ))
+                }
+            }
+        } else {
+            // OLD format: direct value (backward compatibility)
+            // Put the byte back and deserialize the inner value directly
+            // We need to reconstruct the deserializer state with the byte we already read
+            match major {
+                MAJOR_MAP => match self.read_length(info)? {
+                    Some(len) => visitor.visit_newtype_struct(MapDeserializer {
+                        de: self,
+                        remaining: Some(len as usize),
+                    }),
+                    None => visitor.visit_newtype_struct(MapDeserializer {
+                        de: self,
+                        remaining: None,
+                    }),
+                },
+                MAJOR_TEXT => {
+                    let len = self.read_length(info)?.ok_or_else(|| {
+                        Error::Syntax("Text in newtype must be definite length".to_string())
+                    })?;
+                    let mut buf = vec![0u8; len as usize];
+                    self.reader.read_exact(&mut buf)?;
+                    let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
+                    visitor.visit_newtype_struct(StringDeserializer { value: s })
+                }
+                _ => {
+                    // For other types, use prefetched deserializer
+                    visitor.visit_newtype_struct(PrefetchedDeserializer {
+                        de: self,
+                        major,
+                        info,
+                    })
+                }
+            }
+        }
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
-        bytes byte_buf unit unit_struct newtype_struct seq tuple
+        bytes byte_buf unit unit_struct seq tuple
         tuple_struct map struct identifier ignored_any
     }
 }
@@ -1166,14 +1264,14 @@ struct MapDeserializer<'a, R: Read> {
 
 impl<'de, 'a, R: Read> serde::Deserializer<'de> for MapDeserializer<'a, R> {
     type Error = crate::Error;
-    
+
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         visitor.visit_map(MapAccess {
             de: self.de,
             remaining: self.remaining,
         })
     }
-    
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
@@ -1188,14 +1286,14 @@ struct ArrayDeserializer<'a, R: Read> {
 
 impl<'de, 'a, R: Read> serde::Deserializer<'de> for ArrayDeserializer<'a, R> {
     type Error = crate::Error;
-    
+
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         visitor.visit_seq(SeqAccess {
             de: self.de,
             remaining: self.remaining,
         })
     }
-    
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
@@ -1211,26 +1309,34 @@ struct PrefetchedDeserializer<'a, R: Read> {
 
 impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R> {
     type Error = crate::Error;
-    
+
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         match self.major {
             MAJOR_UNSIGNED => {
-                let val = self.de.read_length(self.info)?.ok_or_else(|| Error::Syntax("Unsigned integer cannot be indefinite".to_string()))?;
+                let val = self.de.read_length(self.info)?.ok_or_else(|| {
+                    Error::Syntax("Unsigned integer cannot be indefinite".to_string())
+                })?;
                 visitor.visit_u64(val)
             }
             MAJOR_NEGATIVE => {
-                let val = self.de.read_length(self.info)?.ok_or_else(|| Error::Syntax("Negative integer cannot be indefinite".to_string()))?;
+                let val = self.de.read_length(self.info)?.ok_or_else(|| {
+                    Error::Syntax("Negative integer cannot be indefinite".to_string())
+                })?;
                 visitor.visit_i64(-1 - val as i64)
             }
             MAJOR_TEXT => {
-                let len = self.de.read_length(self.info)?.ok_or_else(|| Error::Syntax("Text in option must be definite length".to_string()))?;
+                let len = self.de.read_length(self.info)?.ok_or_else(|| {
+                    Error::Syntax("Text in option must be definite length".to_string())
+                })?;
                 let mut buf = vec![0u8; len as usize];
                 self.de.reader.read_exact(&mut buf)?;
                 let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
                 visitor.visit_string(s)
             }
             MAJOR_BYTES => {
-                let len = self.de.read_length(self.info)?.ok_or_else(|| Error::Syntax("Bytes in option must be definite length".to_string()))?;
+                let len = self.de.read_length(self.info)?.ok_or_else(|| {
+                    Error::Syntax("Bytes in option must be definite length".to_string())
+                })?;
                 let mut buf = vec![0u8; len as usize];
                 self.de.reader.read_exact(&mut buf)?;
                 visitor.visit_byte_buf(buf)
@@ -1243,7 +1349,26 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
             _ => Err(Error::Syntax("Unsupported type in option".to_string())),
         }
     }
-    
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+// String deserializer for backward compatibility in newtype structs
+struct StringDeserializer {
+    value: String,
+}
+
+impl<'de> serde::Deserializer<'de> for StringDeserializer {
+    type Error = crate::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        visitor.visit_string(self.value)
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
@@ -1331,10 +1456,7 @@ impl<'de, 'a, R: Read> serde::de::VariantAccess<'de> for VariantAccess<'a, R> {
         Err(Error::Syntax("Expected variant with data".to_string()))
     }
 
-    fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(
-        self,
-        seed: T,
-    ) -> Result<T::Value> {
+    fn newtype_variant_seed<T: serde::de::DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> {
         seed.deserialize(&mut *self.de)
     }
 
@@ -1447,10 +1569,10 @@ pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
     if slice.is_empty() {
         return Err(Error::Syntax("empty input".to_string()));
     }
-    
+
     let mut decoder = Decoder::new(slice);
     let value = decoder.decode()?;
-    
+
     // Check if all bytes were consumed
     let remaining = decoder.reader.len();
     if remaining > 0 {
@@ -1459,7 +1581,7 @@ pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
             remaining
         )));
     }
-    
+
     Ok(value)
 }
 
@@ -2097,7 +2219,7 @@ mod tests {
         // Manually encode an indefinite-length array
         let mut buf = Vec::new();
         let mut enc = Encoder::new(&mut buf);
-        
+
         // Start indefinite array
         enc.write_array_indefinite().unwrap();
         // Add elements
@@ -2121,7 +2243,7 @@ mod tests {
         // Manually encode an indefinite-length map
         let mut buf = Vec::new();
         let mut enc = Encoder::new(&mut buf);
-        
+
         // Start indefinite map
         enc.write_map_indefinite().unwrap();
         // Add key-value pairs
@@ -2145,20 +2267,20 @@ mod tests {
     #[test]
     fn test_indefinite_byte_string() {
         use serde_bytes::ByteBuf;
-        
+
         // Manually encode indefinite-length byte string (chunked)
         let mut buf = Vec::new();
         buf.push((MAJOR_BYTES << 5) | INDEFINITE); // Start indefinite bytes
-        
+
         // Add chunks as byte strings
         let chunk1 = vec![1u8, 2, 3];
         let chunk1_enc = to_vec(&ByteBuf::from(chunk1.clone())).unwrap();
         buf.extend_from_slice(&chunk1_enc);
-        
+
         let chunk2 = vec![4u8, 5];
         let chunk2_enc = to_vec(&ByteBuf::from(chunk2.clone())).unwrap();
         buf.extend_from_slice(&chunk2_enc);
-        
+
         buf.push(BREAK); // End indefinite
 
         // Decode should concatenate chunks
@@ -2171,16 +2293,16 @@ mod tests {
         // Manually encode indefinite-length text string (chunked)
         let mut buf = Vec::new();
         buf.push((MAJOR_TEXT << 5) | INDEFINITE); // Start indefinite text
-        
+
         // Add chunks
         let chunk1 = "Hello";
         let chunk1_enc = to_vec(&chunk1).unwrap();
         buf.extend_from_slice(&chunk1_enc);
-        
+
         let chunk2 = " World";
         let chunk2_enc = to_vec(&chunk2).unwrap();
         buf.extend_from_slice(&chunk2_enc);
-        
+
         buf.push(BREAK); // End indefinite
 
         // Decode should concatenate chunks
@@ -2191,14 +2313,14 @@ mod tests {
     #[test]
     fn test_ser_module_serializer() {
         use crate::ser::Serializer;
-        
+
         // Test that ser::Serializer works correctly
         let buf = Vec::new();
         let mut serializer = Serializer::new(buf);
-        
+
         let data = vec![1, 2, 3];
         data.serialize(&mut serializer).unwrap();
-        
+
         let encoded = serializer.into_inner();
         let decoded: Vec<i32> = from_slice(&encoded).unwrap();
         assert_eq!(decoded, vec![1, 2, 3]);
@@ -2207,7 +2329,7 @@ mod tests {
     #[test]
     fn test_struct_with_option_fields() {
         use std::collections::HashMap;
-        
+
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct TestData {
             name: String,
@@ -2215,22 +2337,22 @@ mod tests {
             optional_map: Option<HashMap<String, String>>,
             optional_string: Option<String>,
         }
-        
+
         // Test with Some values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), "value1".to_string());
-        
+
         let data_with_some = TestData {
             name: "test".to_string(),
             value: 42,
             optional_map: Some(map),
             optional_string: Some("hello".to_string()),
         };
-        
+
         let encoded = to_vec(&data_with_some).unwrap();
         let decoded: TestData = from_slice(&encoded).unwrap();
         assert_eq!(data_with_some, decoded);
-        
+
         // Test with None values
         let data_with_none = TestData {
             name: "test".to_string(),
@@ -2238,7 +2360,7 @@ mod tests {
             optional_map: None,
             optional_string: None,
         };
-        
+
         let encoded_none = to_vec(&data_with_none).unwrap();
         let decoded_none: TestData = from_slice(&encoded_none).unwrap();
         assert_eq!(data_with_none, decoded_none);
@@ -2250,26 +2372,26 @@ mod tests {
         struct Outer {
             data: Option<Inner>,
         }
-        
+
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct Inner {
             values: HashMap<String, i32>,
         }
-        
+
         let mut values = HashMap::new();
         values.insert("a".to_string(), 1);
         values.insert("b".to_string(), 2);
-        
+
         let outer = Outer {
             data: Some(Inner { values }),
         };
-        
+
         let encoded = to_vec(&outer).unwrap();
         println!("Encoded bytes: {:?}", encoded);
         let decoded: Outer = from_slice(&encoded).unwrap();
         assert_eq!(outer, decoded);
     }
-    
+
     #[test]
     fn test_option_field_counting() {
         // Test to understand how serde counts fields with Option
@@ -2279,51 +2401,51 @@ mod tests {
             field2: Option<String>,
             field3: Option<String>,
         }
-        
+
         let data = WithOptions {
             field1: "hello".to_string(),
             field2: Some("world".to_string()),
             field3: None,
         };
-        
+
         // This should trigger the error if serialize_struct gets wrong len
         let encoded = to_vec(&data).unwrap();
         println!("Encoded bytes: {:?}", encoded);
-        
+
         // Check the first byte - should be a map with the right number of entries
         // Map header format: major type 5 (0xA0 | count) or 0xB8 + count byte
         println!("First byte: 0x{:02x}", encoded[0]);
     }
-    
+
     #[test]
     fn test_trait_object_serialization() {
         // Reproduce the AssertionCbor scenario
         use std::collections::HashMap;
-        
+
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct TestStruct {
             name: String,
             values: HashMap<String, String>,
         }
-        
+
         let mut map = HashMap::new();
         map.insert("key1".to_string(), "value1".to_string());
         map.insert("key2".to_string(), "value2".to_string());
-        
+
         let obj = TestStruct {
             name: "test".to_string(),
             values: map,
         };
-        
+
         // Serialize directly
         let encoded = to_vec(&obj).unwrap();
         println!("Encoded: {:?}", encoded);
-        
+
         // Decode should work
         let decoded: TestStruct = from_slice(&encoded).unwrap();
         assert_eq!(obj, decoded);
     }
-    
+
     #[test]
     fn test_skip_serializing_if() {
         // This reproduces the Actions struct issue
@@ -2335,94 +2457,96 @@ mod tests {
             #[serde(skip_serializing_if = "Option::is_none")]
             rarely: Option<Vec<String>>,
         }
-        
+
         // Test with None values - this will try to serialize 3 fields but skip 2
         let obj = SkipTest {
             always: "hello".to_string(),
             sometimes: None,
             rarely: None,
         };
-        
+
         // This should work - serde should tell us len=1, not len=3
         let encoded = to_vec(&obj).unwrap();
         println!("Encoded skip test: {:?}", encoded);
         println!("First byte: 0x{:02x}", encoded[0]);
-        
+
         let decoded: SkipTest = from_slice(&encoded).unwrap();
         assert_eq!(obj, decoded);
     }
-    
+
     #[test]
     fn test_actions_like_struct() {
         // Reproduce the exact Actions structure
         use std::collections::HashMap;
-        
+
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct ActionLike {
             params: Option<HashMap<String, Vec<u8>>>,
         }
-        
+
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct ActionsLike {
             actions: Vec<ActionLike>,
             #[serde(skip_serializing_if = "Option::is_none")]
             metadata: Option<HashMap<String, String>>,
         }
-        
+
         let mut params = HashMap::new();
         params.insert("key1".to_string(), vec![1, 2, 3]);
-        
+
         let mut metadata = HashMap::new();
         metadata.insert("meta1".to_string(), "value1".to_string());
-        
+
         let obj = ActionsLike {
-            actions: vec![ActionLike { params: Some(params) }],
+            actions: vec![ActionLike {
+                params: Some(params),
+            }],
             metadata: Some(metadata),
         };
-        
+
         // This might trigger the error if there's an issue with HashMap serialization
         let encoded = to_vec(&obj).unwrap();
         println!("Encoded actions-like: {} bytes", encoded.len());
-        
+
         let decoded: ActionsLike = from_slice(&encoded).unwrap();
         assert_eq!(obj, decoded);
     }
-    
+
     #[test]
     fn test_flatten_attribute() {
         // Test #[serde(flatten)] which causes indefinite-length serialization
         use std::collections::HashMap;
-        
+
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct WithFlatten {
             regular_field: String,
             #[serde(flatten)]
             flattened: HashMap<String, String>,
         }
-        
+
         let mut map = HashMap::new();
         map.insert("extra1".to_string(), "value1".to_string());
         map.insert("extra2".to_string(), "value2".to_string());
-        
+
         let obj = WithFlatten {
             regular_field: "test".to_string(),
             flattened: map,
         };
-        
+
         // This WILL trigger the indefinite-length path due to flatten
         // Our fallback to Value should handle it
         let encoded = to_vec(&obj).unwrap();
         println!("Encoded flattened: {} bytes", encoded.len());
         println!("First byte: 0x{:02x}", encoded[0]);
-        
+
         let decoded: WithFlatten = from_slice(&encoded).unwrap();
         assert_eq!(obj, decoded);
     }
-    
+
     #[test]
     fn test_enum_serialization() {
         // Test different enum representation styles
-        
+
         // Unit variant (serializes as string)
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         enum SimpleEnum {
@@ -2430,13 +2554,13 @@ mod tests {
             Spatial,
             Other,
         }
-        
+
         let val = SimpleEnum::Temporal;
         let encoded = to_vec(&val).unwrap();
         println!("Simple enum encoded: {:?}", encoded);
         let decoded: SimpleEnum = from_slice(&encoded).unwrap();
         assert_eq!(val, decoded);
-        
+
         // With rename
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         #[serde(rename_all = "lowercase")]
@@ -2444,13 +2568,13 @@ mod tests {
             Temporal,
             Spatial,
         }
-        
+
         let val2 = RenamedEnum::Temporal;
         let encoded2 = to_vec(&val2).unwrap();
         println!("Renamed enum encoded: {:?}", encoded2);
         let decoded2: RenamedEnum = from_slice(&encoded2).unwrap();
         assert_eq!(val2, decoded2);
-        
+
         // Enum with data
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         enum DataEnum {
@@ -2459,14 +2583,16 @@ mod tests {
             Tuple(i32, String),
             Struct { field: String },
         }
-        
-        let val3 = DataEnum::Struct { field: "test".to_string() };
+
+        let val3 = DataEnum::Struct {
+            field: "test".to_string(),
+        };
         let encoded3 = to_vec(&val3).unwrap();
         println!("Struct variant encoded: {:?}", encoded3);
         let decoded3: DataEnum = from_slice(&encoded3).unwrap();
         assert_eq!(val3, decoded3);
     }
-    
+
     #[test]
     fn test_float_serialization() {
         // Test f32
@@ -2477,7 +2603,7 @@ mod tests {
         assert_eq!(encoded[0], (MAJOR_SIMPLE << 5) | 26);
         let decoded: f32 = from_slice(&encoded).unwrap();
         assert_eq!(f32_val, decoded);
-        
+
         // Test f64
         let f64_val = 2.5f64;
         let encoded = to_vec(&f64_val).unwrap();
@@ -2486,7 +2612,7 @@ mod tests {
         assert_eq!(encoded[0], (MAJOR_SIMPLE << 5) | 27);
         let decoded: f64 = from_slice(&encoded).unwrap();
         assert_eq!(f64_val, decoded);
-        
+
         // Test in a struct
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
         struct ExifData {
@@ -2494,13 +2620,13 @@ mod tests {
             exposure_time: f32,
             zoom_ratio: f64,
         }
-        
+
         let exif = ExifData {
             f_number: 4.0,
             exposure_time: 0.01,
             zoom_ratio: 2.0,
         };
-        
+
         let encoded = to_vec(&exif).unwrap();
         println!("Exif data encoded: {} bytes", encoded.len());
         let decoded: ExifData = from_slice(&encoded).unwrap();
@@ -2510,31 +2636,39 @@ mod tests {
     #[test]
     fn test_invalid_cbor_trailing_bytes() {
         use crate::Value;
-        
+
         // These bytes are just a sequence of small integers with no structure
         // The first byte (0x0d = 13) is a valid CBOR integer, but the rest are trailing garbage
         let invalid_bytes = vec![0x0d, 0x0e, 0x0a, 0x0d, 0x0b, 0x0e, 0x0e, 0x0f];
-        
+
         let result: Result<Value> = from_slice(&invalid_bytes);
         assert!(result.is_err(), "Should fail on trailing bytes");
-        
+
         if let Err(e) = result {
             let msg = format!("{:?}", e);
-            assert!(msg.contains("trailing"), "Error should mention trailing data: {}", msg);
+            assert!(
+                msg.contains("trailing"),
+                "Error should mention trailing data: {}",
+                msg
+            );
         }
     }
 
     #[test]
     fn test_empty_input() {
         use crate::Value;
-        
+
         let empty_bytes = vec![];
         let result: Result<Value> = from_slice(&empty_bytes);
         assert!(result.is_err(), "Should fail on empty input");
-        
+
         if let Err(e) = result {
             let msg = format!("{:?}", e);
-            assert!(msg.contains("empty"), "Error should mention empty input: {}", msg);
+            assert!(
+                msg.contains("empty"),
+                "Error should mention empty input: {}",
+                msg
+            );
         }
     }
 
@@ -2542,7 +2676,7 @@ mod tests {
     fn test_incomplete_cbor() {
         // Start of an array but incomplete
         let incomplete = vec![0x85]; // array of 5 elements, but no elements follow
-        
+
         let result: Result<Vec<u32>> = from_slice(&incomplete);
         assert!(result.is_err(), "Should fail on incomplete CBOR");
     }

@@ -339,7 +339,7 @@ struct ValueSerializer;
 impl Serializer for ValueSerializer {
     type Ok = Value;
     type Error = crate::Error;
-    
+
     type SerializeSeq = SerializeVec;
     type SerializeTuple = SerializeVec;
     type SerializeTupleStruct = SerializeVec;
@@ -384,7 +384,10 @@ impl Serializer for ValueSerializer {
         if v <= i64::MAX as u64 {
             Ok(Value::Integer(v as i64))
         } else {
-            Err(crate::Error::Message(format!("u64 value {} too large for i64", v)))
+            Err(crate::Error::Message(format!(
+                "u64 value {} too large for i64",
+                v
+            )))
         }
     }
 
@@ -449,7 +452,10 @@ impl Serializer for ValueSerializer {
         value: &T,
     ) -> Result<Value, crate::Error> {
         let mut map = BTreeMap::new();
-        map.insert(Value::Text(variant.to_string()), value.serialize(ValueSerializer)?);
+        map.insert(
+            Value::Text(variant.to_string()),
+            value.serialize(ValueSerializer)?,
+        );
         Ok(Value::Map(map))
     }
 
