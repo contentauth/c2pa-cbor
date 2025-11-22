@@ -198,15 +198,15 @@ The buffering path adds minimal overhead and only activates when necessary, maki
 Compared to `serde_cbor`:
 
 ### Serialization (Encoding)
-- **15-27% faster** for typical workloads
-- Identical output size (same CBOR encoding)
+- **10-32% faster** for typical workloads
+- Identical output size for most structures
 - Zero overhead for known-length collections
 
 ### Deserialization (Decoding)  
-- **Only 3-18% slower** than serde_cbor (optimized slice decoder)
-- Simple structs: 1.18x slower (was 2.4x before optimization)
-- Complex structs: 1.03x slower (nearly identical!)
-- Direct slice indexing avoids `std::io::Read` trait overhead
+- **30-50% slower** than serde_cbor for many small structures
+- Simple structs: 2.16x slower (227ns vs 105ns per struct)
+- Complex structs: 1.30x slower (1.73µs vs 1.33µs per struct)
+- Large binary data: ~31.5 GB/s (excellent performance)
 
 ### When to use c2pa_cbor
 ✅ **Prefer c2pa_cbor if you need:**
@@ -214,10 +214,10 @@ Compared to `serde_cbor`:
 - Guaranteed deterministic/canonical CBOR output
 - Backward compatibility with different newtype struct formats
 - Faster serialization for content creation workflows
-- Competitive deserialization performance
+- Good-enough deserialization (< 100ms for 1MB of structured data)
 
 ✅ **Stick with serde_cbor if:**
-- You need the absolute fastest deserialization (3-18% faster)
+- You need the absolute fastest deserialization (30-50% faster for small structures)
 - Every nanosecond matters in your hot path
 
 For most C2PA use cases, c2pa_cbor provides an excellent balance of features, maintainability, and performance.
