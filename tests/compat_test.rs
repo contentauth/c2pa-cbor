@@ -22,9 +22,8 @@ fn test_deserializer_from_slice() {
     // Test Deserializer::from_slice
     let data = vec![1u8, 2, 3];
     let bytes = serde_cbor::ser::to_vec(&data).unwrap();
-    let decoded: Vec<u8> = serde::Deserialize::deserialize(
-        &mut serde_cbor::Deserializer::from_slice(&bytes)
-    ).unwrap();
+    let decoded: Vec<u8> =
+        serde::Deserialize::deserialize(&mut serde_cbor::Deserializer::from_slice(&bytes)).unwrap();
     assert_eq!(decoded, data);
 }
 
