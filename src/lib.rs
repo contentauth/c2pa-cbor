@@ -1444,8 +1444,23 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 
 /// Deserializes a value from CBOR bytes
 pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
+    if slice.is_empty() {
+        return Err(Error::Syntax("empty input".to_string()));
+    }
+    
     let mut decoder = Decoder::new(slice);
-    decoder.decode()
+    let value = decoder.decode()?;
+    
+    // Check if all bytes were consumed
+    let remaining = decoder.reader.len();
+    if remaining > 0 {
+        return Err(Error::Syntax(format!(
+            "unexpected trailing data: {} bytes remaining",
+            remaining
+        )));
+    }
+    
+    Ok(value)
 }
 
 /// Serializes a value to a CBOR writer
@@ -2490,6 +2505,55 @@ mod tests {
         println!("Exif data encoded: {} bytes", encoded.len());
         let decoded: ExifData = from_slice(&encoded).unwrap();
         assert_eq!(exif, decoded);
+    }
+
+    #[test]
+    fn test_invalid_cbor_trailing_bytes() {
+        use crate::Value;
+        
+        // These bytes are just a sequence of small integers with no structure
+        // The first byte (0x0d = 13) is a valid CBOR integer, but the rest are trailing garbage
+        let invalid_bytes = vec![0x0d, 0x0e, 0x0a, 0x0d, 0x0b, 0x0e, 0x0e, 0x0f];
+        
+        let result: Result<Value> = from_slice(&invalid_bytes);
+        assert!(result.is_err(), "Should fail on trailing bytes");
+        
+        if let Err(e) = result {
+            let msg = format!("{:?}", e);
+            assert!(msg.contains("trailing"), "Error should mention trailing data: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_empty_input() {
+        use crate::Value;
+        
+        let empty_bytes = vec![];
+        let result: Result<Value> = from_slice(&empty_bytes);
+        assert!(result.is_err(), "Should fail on empty input");
+        
+        if let Err(e) = result {
+            let msg = format!("{:?}", e);
+            assert!(msg.contains("empty"), "Error should mention empty input: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_incomplete_cbor() {
+        // Start of an array but incomplete
+        let incomplete = vec![0x85]; // array of 5 elements, but no elements follow
+        
+        let result: Result<Vec<u32>> = from_slice(&incomplete);
+        assert!(result.is_err(), "Should fail on incomplete CBOR");
+    }
+
+    #[test]
+    fn test_valid_cbor_all_bytes_consumed() {
+        // Valid integer should consume exactly 1 byte
+        let valid = vec![0x0d]; // integer 13
+        let result: Result<u32> = from_slice(&valid);
+        assert!(result.is_ok(), "Should succeed on valid CBOR");
+        assert_eq!(result.unwrap(), 13);
     }
 }
 
