@@ -452,3 +452,51 @@ fn test_transcode_from_json_with_flatten() {
         Some(true)
     );
 }
+
+#[test]
+fn test_serialization_paths() {
+    // Documents the two serialization paths: direct (fast) vs buffered (compatible)
+    use std::collections::HashMap;
+
+    // FAST PATH: Regular struct with known field count
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct FastPath {
+        field1: String,
+        field2: i32,
+        field3: bool,
+    }
+
+    let fast = FastPath {
+        field1: "test".to_string(),
+        field2: 42,
+        field3: true,
+    };
+
+    let cbor = c2pa_cbor::to_vec(&fast).expect("fast path serialization");
+    let decoded: FastPath = c2pa_cbor::from_slice(&cbor).expect("deserialize");
+    assert_eq!(fast, decoded);
+
+    // BUFFERED PATH: Struct with #[serde(flatten)] causing unknown map size
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct BufferedPath {
+        known_field: String,
+        #[serde(flatten)]
+        extra: HashMap<String, String>,
+    }
+
+    let mut extra = HashMap::new();
+    extra.insert("dynamic1".to_string(), "value1".to_string());
+    extra.insert("dynamic2".to_string(), "value2".to_string());
+
+    let buffered = BufferedPath {
+        known_field: "test".to_string(),
+        extra,
+    };
+
+    let cbor = c2pa_cbor::to_vec(&buffered).expect("buffered path serialization");
+    let decoded: BufferedPath = c2pa_cbor::from_slice(&cbor).expect("deserialize");
+    assert_eq!(buffered, decoded);
+
+    // Both produce valid definite-length CBOR (required for C2PA)
+    // The difference is internal: fast path writes directly, buffered path collects first
+}

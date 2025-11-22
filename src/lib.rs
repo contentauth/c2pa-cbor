@@ -5,6 +5,18 @@
 //!
 //! A CBOR (Concise Binary Object Representation) encoder/decoder with support for tagged types.
 //!
+//! ## Architecture
+//!
+//! This library uses a **dual-path serialization strategy** for optimal performance:
+//!
+//! - **Fast path**: When collection sizes are known at compile time (the common case),
+//!   data is written directly to the output with zero buffering overhead.
+//! - **Buffering path**: When sizes are unknown (e.g., `#[serde(flatten)]` in `serde_transcode`),
+//!   entries are buffered in memory and written as definite-length once the count is known.
+//!
+//! This design maintains C2PA's requirement for deterministic, definite-length encoding
+//! while supporting the full serde data model including complex features like flatten.
+//!
 //! ## Features
 //! - Full support for CBOR major types 0-7
 //! - Tagged types (major type 6) including:
@@ -261,15 +273,26 @@ impl<W: Write> Encoder<W> {
 }
 
 /// Wrapper for serializing sequences/maps with optional buffering
-/// When length is known, writes directly; when unknown, buffers entries
+///
+/// When serde knows the collection length (the common case), this writes directly
+/// to the encoder without buffering. When the length is unknown (e.g., due to
+/// `#[serde(flatten)]` or custom iterators), it buffers entries in memory and
+/// writes them as definite-length once the count is known.
+///
+/// This ensures compatibility with `serde_transcode` and maintains C2PA's
+/// requirement for definite-length encoding while avoiding the need for
+/// indefinite-length CBOR support.
 pub enum SerializeVec<'a, W: Write> {
+    /// Direct mode: length known, writes immediately (zero overhead)
     Direct {
         encoder: &'a mut Encoder<W>,
     },
+    /// Array buffering mode: length unknown, collects elements
     Array {
         encoder: &'a mut Encoder<W>,
         buffer: Vec<Vec<u8>>,
     },
+    /// Map buffering mode: length unknown, collects key-value pairs
     Map {
         encoder: &'a mut Encoder<W>,
         buffer: Vec<(Vec<u8>, Vec<u8>)>,
@@ -413,11 +436,13 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
         match len {
             Some(len) => {
+                // Fast path: length known, write header immediately (no buffering)
                 self.write_type_value(MAJOR_ARRAY, len as u64)?;
                 Ok(SerializeVec::Direct { encoder: self })
             }
             None => {
-                // Unknown length - buffer elements
+                // Slow path: length unknown (rare), buffer elements until end()
+                // Only happens with custom iterators that don't implement ExactSizeIterator
                 Ok(SerializeVec::Array {
                     encoder: self,
                     buffer: Vec::new(),
@@ -454,13 +479,13 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
         match len {
             Some(len) => {
-                // Definite-length map: write size immediately
+                // Fast path: length known, write header immediately (no buffering)
                 self.write_type_value(MAJOR_MAP, len as u64)?;
                 Ok(SerializeVec::Direct { encoder: self })
             }
             None => {
-                // Indefinite-length map requested (e.g., from #[serde(flatten)])
-                // Buffer key-value pairs until end
+                // Slow path: length unknown, buffer key-value pairs until end()
+                // Happens with #[serde(flatten)] or custom map-like types in serde_transcode
                 Ok(SerializeVec::Map {
                     encoder: self,
                     buffer: Vec::new(),
@@ -600,6 +625,25 @@ impl<'a, W: Write> serde::ser::SerializeStructVariant for &'a mut Encoder<W> {
 
 // Implementations for SerializeVec (handles buffering for unknown-length collections)
 
+impl<'a, W: Write> SerializeVec<'a, W> {
+    /// Serialize a value to a buffer for later writing
+    fn serialize_to_buffer<T>(value: &T) -> Result<Vec<u8>>
+    where
+        T: ?Sized + Serialize,
+    {
+        let mut buf = Vec::new();
+        let mut encoder = Encoder::new(&mut buf);
+        value.serialize(&mut encoder)?;
+        Ok(buf)
+    }
+
+    /// Write buffered bytes to the encoder's writer
+    fn write_buffered(encoder: &mut Encoder<W>, bytes: &[u8]) -> Result<()> {
+        encoder.writer.write_all(bytes)?;
+        Ok(())
+    }
+}
+
 impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
     type Ok = ();
     type Error = crate::Error;
@@ -611,10 +655,7 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
         match self {
             SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
             SerializeVec::Array { buffer, .. } => {
-                let mut element_buf = Vec::new();
-                let mut element_encoder = Encoder::new(&mut element_buf);
-                value.serialize(&mut element_encoder)?;
-                buffer.push(element_buf);
+                buffer.push(Self::serialize_to_buffer(value)?);
                 Ok(())
             }
             SerializeVec::Map { .. } => Err(Error::Message(
@@ -631,7 +672,7 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
                 encoder.write_type_value(MAJOR_ARRAY, buffer.len() as u64)?;
                 // Write all buffered elements
                 for element_bytes in buffer {
-                    encoder.writer.write_all(&element_bytes)?;
+                    Self::write_buffered(encoder, &element_bytes)?;
                 }
                 Ok(())
             }
@@ -679,10 +720,7 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
         match self {
             SerializeVec::Direct { encoder } => key.serialize(&mut **encoder),
             SerializeVec::Map { pending_key, .. } => {
-                let mut key_buf = Vec::new();
-                let mut key_encoder = Encoder::new(&mut key_buf);
-                key.serialize(&mut key_encoder)?;
-                *pending_key = Some(key_buf);
+                *pending_key = Some(Self::serialize_to_buffer(key)?);
                 Ok(())
             }
             SerializeVec::Array { .. } => Err(Error::Message(
@@ -702,11 +740,9 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 pending_key,
                 ..
             } => {
-                let mut value_buf = Vec::new();
-                let mut value_encoder = Encoder::new(&mut value_buf);
-                value.serialize(&mut value_encoder)?;
+                let value_bytes = Self::serialize_to_buffer(value)?;
                 if let Some(key_bytes) = pending_key.take() {
-                    buffer.push((key_bytes, value_buf));
+                    buffer.push((key_bytes, value_bytes));
                     Ok(())
                 } else {
                     Err(Error::Message(
@@ -737,8 +773,8 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
                 // Write all buffered key-value pairs
                 for (key_bytes, value_bytes) in buffer {
-                    encoder.writer.write_all(&key_bytes)?;
-                    encoder.writer.write_all(&value_bytes)?;
+                    Self::write_buffered(encoder, &key_bytes)?;
+                    Self::write_buffered(encoder, &value_bytes)?;
                 }
                 Ok(())
             }
