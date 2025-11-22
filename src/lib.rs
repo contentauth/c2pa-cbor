@@ -70,7 +70,7 @@
 mod constants;
 
 pub mod error;
-use error::{Error, Result};
+pub use error::{Error, Result};
 
 pub mod encoder;
 pub use encoder::{Encoder, to_vec, to_writer};

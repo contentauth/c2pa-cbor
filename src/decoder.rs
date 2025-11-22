@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::{Error, Result};
 use serde::Deserialize;
-use std::io::Read;
+use std::io::{BufReader, Read};
 
 pub struct Decoder<R: Read> {
     reader: R,
@@ -985,7 +985,10 @@ pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
 }
 
 /// Deserializes a value from a CBOR reader
+///
+/// Wraps the reader in a BufReader for optimal performance with small reads.
+/// If the reader is already buffered, consider using Decoder::new() directly.
 pub fn from_reader<R: Read, T: for<'de> Deserialize<'de>>(reader: R) -> Result<T> {
-    let mut decoder = Decoder::new(reader);
+    let mut decoder = Decoder::new(BufReader::new(reader));
     decoder.decode()
 }
