@@ -411,3 +411,92 @@ fn test_transparent_newtype() {
 
     assert_eq!(wrapper, deserialized);
 }
+
+#[test]
+fn test_transcode_from_json_with_flatten() {
+    // Tests serde_transcode with #[serde(flatten)] which causes indefinite-length maps
+    // This was causing "indefinite-length maps require manual encoding" errors
+    use serde_json;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct WithFlatten {
+        name: String,
+        #[serde(flatten)]
+        extra: HashMap<String, serde_json::Value>,
+    }
+
+    let json_str = r#"{"name":"test","param1":"value1","param2":42,"param3":true}"#;
+
+    // Transcode from JSON to CBOR using ser::Serializer
+    let buf: Vec<u8> = Vec::new();
+    let mut from = serde_json::Deserializer::from_str(json_str);
+    let mut to = c2pa_cbor::ser::Serializer::new(buf);
+
+    serde_transcode::transcode(&mut from, &mut to).expect("transcode should work with flatten");
+
+    let cbor_bytes = to.into_inner();
+
+    // Verify it deserializes correctly
+    let decoded: WithFlatten = c2pa_cbor::from_slice(&cbor_bytes).expect("deserialize");
+    assert_eq!(decoded.name, "test");
+    assert_eq!(
+        decoded.extra.get("param1").and_then(|v| v.as_str()),
+        Some("value1")
+    );
+    assert_eq!(
+        decoded.extra.get("param2").and_then(|v| v.as_i64()),
+        Some(42)
+    );
+    assert_eq!(
+        decoded.extra.get("param3").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn test_serialization_paths() {
+    // Documents the two serialization paths: direct (fast) vs buffered (compatible)
+    use std::collections::HashMap;
+
+    // FAST PATH: Regular struct with known field count
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct FastPath {
+        field1: String,
+        field2: i32,
+        field3: bool,
+    }
+
+    let fast = FastPath {
+        field1: "test".to_string(),
+        field2: 42,
+        field3: true,
+    };
+
+    let cbor = c2pa_cbor::to_vec(&fast).expect("fast path serialization");
+    let decoded: FastPath = c2pa_cbor::from_slice(&cbor).expect("deserialize");
+    assert_eq!(fast, decoded);
+
+    // BUFFERED PATH: Struct with #[serde(flatten)] causing unknown map size
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct BufferedPath {
+        known_field: String,
+        #[serde(flatten)]
+        extra: HashMap<String, String>,
+    }
+
+    let mut extra = HashMap::new();
+    extra.insert("dynamic1".to_string(), "value1".to_string());
+    extra.insert("dynamic2".to_string(), "value2".to_string());
+
+    let buffered = BufferedPath {
+        known_field: "test".to_string(),
+        extra,
+    };
+
+    let cbor = c2pa_cbor::to_vec(&buffered).expect("buffered path serialization");
+    let decoded: BufferedPath = c2pa_cbor::from_slice(&cbor).expect("deserialize");
+    assert_eq!(buffered, decoded);
+
+    // Both produce valid definite-length CBOR (required for C2PA)
+    // The difference is internal: fast path writes directly, buffered path collects first
+}

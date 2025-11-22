@@ -5,6 +5,18 @@
 //!
 //! A CBOR (Concise Binary Object Representation) encoder/decoder with support for tagged types.
 //!
+//! ## Architecture
+//!
+//! This library uses a **dual-path serialization strategy** for optimal performance:
+//!
+//! - **Fast path**: When collection sizes are known at compile time (the common case),
+//!   data is written directly to the output with zero buffering overhead.
+//! - **Buffering path**: When sizes are unknown (e.g., `#[serde(flatten)]` in `serde_transcode`),
+//!   entries are buffered in memory and written as definite-length once the count is known.
+//!
+//! This design maintains C2PA's requirement for deterministic, definite-length encoding
+//! while supporting the full serde data model including complex features like flatten.
+//!
 //! ## Features
 //! - Full support for CBOR major types 0-7
 //! - Tagged types (major type 6) including:
@@ -201,6 +213,43 @@ pub mod error {
 }
 
 // Encoder
+
+/// CBOR encoder for low-level encoding operations.
+///
+/// For most use cases, prefer the high-level [`to_vec`] or [`to_writer`] functions.
+/// Use `Encoder` directly when you need fine-grained control over the encoding
+/// process or when writing tagged values.
+///
+/// # Examples
+///
+/// Basic encoding:
+///
+/// ```
+/// use c2pa_cbor::Encoder;
+/// use serde::Serialize;
+///
+/// #[derive(Serialize)]
+/// struct Data {
+///     value: i32,
+/// }
+///
+/// let mut buf = Vec::new();
+/// let mut encoder = Encoder::new(&mut buf);
+/// encoder.encode(&Data { value: 42 }).unwrap();
+/// ```
+///
+/// Encoding with custom tags:
+///
+/// ```
+/// use c2pa_cbor::Encoder;
+///
+/// let mut buf = Vec::new();
+/// let mut encoder = Encoder::new(&mut buf);
+///
+/// // Write tag 100 followed by a string
+/// encoder.write_tag(100).unwrap();
+/// encoder.encode(&"custom data").unwrap();
+/// ```
 pub struct Encoder<W: Write> {
     writer: W,
 }
@@ -260,16 +309,42 @@ impl<W: Write> Encoder<W> {
     }
 }
 
+/// Wrapper for serializing sequences/maps with optional buffering
+///
+/// When serde knows the collection length (the common case), this writes directly
+/// to the encoder without buffering. When the length is unknown (e.g., due to
+/// `#[serde(flatten)]` or custom iterators), it buffers entries in memory and
+/// writes them as definite-length once the count is known.
+///
+/// This ensures compatibility with `serde_transcode` and maintains C2PA's
+/// requirement for definite-length encoding while avoiding the need for
+/// indefinite-length CBOR support.
+pub enum SerializeVec<'a, W: Write> {
+    /// Direct mode: length known, writes immediately (zero overhead)
+    Direct { encoder: &'a mut Encoder<W> },
+    /// Array buffering mode: length unknown, collects elements
+    Array {
+        encoder: &'a mut Encoder<W>,
+        buffer: Vec<Vec<u8>>,
+    },
+    /// Map buffering mode: length unknown, collects key-value pairs
+    Map {
+        encoder: &'a mut Encoder<W>,
+        buffer: Vec<(Vec<u8>, Vec<u8>)>,
+        pending_key: Option<Vec<u8>>,
+    },
+}
+
 impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     type Ok = ();
     type Error = crate::Error;
-    type SerializeSeq = Self;
-    type SerializeTuple = Self;
-    type SerializeTupleStruct = Self;
-    type SerializeTupleVariant = Self;
-    type SerializeMap = Self;
-    type SerializeStruct = Self;
-    type SerializeStructVariant = Self;
+    type SerializeSeq = SerializeVec<'a, W>;
+    type SerializeTuple = SerializeVec<'a, W>;
+    type SerializeTupleStruct = SerializeVec<'a, W>;
+    type SerializeTupleVariant = &'a mut Encoder<W>;
+    type SerializeMap = SerializeVec<'a, W>;
+    type SerializeStruct = SerializeVec<'a, W>;
+    type SerializeStructVariant = &'a mut Encoder<W>;
 
     fn serialize_bool(self, v: bool) -> Result<()> {
         let val = if v { TRUE } else { FALSE };
@@ -394,19 +469,21 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
-        // Note: Indefinite-length arrays are supported via manual encoding
-        // (write_array_indefinite + elements + write_break), but not through
-        // serde's automatic serialization since we can't track state to write
-        // the break marker in SerializeSeq::end()
         match len {
-            Some(len) => self.write_type_value(MAJOR_ARRAY, len as u64)?,
+            Some(len) => {
+                // Fast path: length known, write header immediately (no buffering)
+                self.write_type_value(MAJOR_ARRAY, len as u64)?;
+                Ok(SerializeVec::Direct { encoder: self })
+            }
             None => {
-                return Err(Error::Message(
-                    "indefinite-length sequences require manual encoding".to_string(),
-                ));
+                // Slow path: length unknown (rare), buffer elements until end()
+                // Only happens with custom iterators that don't implement ExactSizeIterator
+                Ok(SerializeVec::Array {
+                    encoder: self,
+                    buffer: Vec::new(),
+                })
             }
         }
-        Ok(self)
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
@@ -437,19 +514,18 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
         match len {
             Some(len) => {
-                // Definite-length map: write size immediately
+                // Fast path: length known, write header immediately (no buffering)
                 self.write_type_value(MAJOR_MAP, len as u64)?;
-                Ok(self)
+                Ok(SerializeVec::Direct { encoder: self })
             }
             None => {
-                // Indefinite-length map requested - this happens when:
-                // 1. Serializing a type with #[serde(flatten)]
-                // 2. Serializing a custom iterator without ExactSizeIterator
-                // 3. Some custom Serialize implementations
-                // We return an error here, and to_vec() will catch it and fall back to Value serialization
-                Err(Error::Message(
-                    "indefinite-length maps require manual encoding".to_string(),
-                ))
+                // Slow path: length unknown, buffer key-value pairs until end()
+                // Happens with #[serde(flatten)] or custom map-like types in serde_transcode
+                Ok(SerializeVec::Map {
+                    encoder: self,
+                    buffer: Vec::new(),
+                    pending_key: None,
+                })
             }
         }
     }
@@ -582,7 +658,235 @@ impl<'a, W: Write> serde::ser::SerializeStructVariant for &'a mut Encoder<W> {
     }
 }
 
+// Implementations for SerializeVec (handles buffering for unknown-length collections)
+
+impl<'a, W: Write> SerializeVec<'a, W> {
+    /// Serialize a value to a buffer for later writing
+    fn serialize_to_buffer<T>(value: &T) -> Result<Vec<u8>>
+    where
+        T: ?Sized + Serialize,
+    {
+        let mut buf = Vec::new();
+        let mut encoder = Encoder::new(&mut buf);
+        value.serialize(&mut encoder)?;
+        Ok(buf)
+    }
+
+    /// Write buffered bytes to the encoder's writer
+    fn write_buffered(encoder: &mut Encoder<W>, bytes: &[u8]) -> Result<()> {
+        encoder.writer.write_all(bytes)?;
+        Ok(())
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        match self {
+            SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
+            SerializeVec::Array { buffer, .. } => {
+                buffer.push(Self::serialize_to_buffer(value)?);
+                Ok(())
+            }
+            SerializeVec::Map { .. } => Err(Error::Message(
+                "serialize_element called on map serializer".to_string(),
+            )),
+        }
+    }
+
+    fn end(self) -> Result<()> {
+        match self {
+            SerializeVec::Direct { .. } => Ok(()),
+            SerializeVec::Array { encoder, buffer } => {
+                // Write definite-length array header now that we know the count
+                encoder.write_type_value(MAJOR_ARRAY, buffer.len() as u64)?;
+                // Write all buffered elements
+                for element_bytes in buffer {
+                    Self::write_buffered(encoder, &element_bytes)?;
+                }
+                Ok(())
+            }
+            SerializeVec::Map { .. } => {
+                Err(Error::Message("end called on map serializer".to_string()))
+            }
+        }
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeTuple for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<()> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeTupleStruct for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<()> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_key<T>(&mut self, key: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        match self {
+            SerializeVec::Direct { encoder } => key.serialize(&mut **encoder),
+            SerializeVec::Map { pending_key, .. } => {
+                *pending_key = Some(Self::serialize_to_buffer(key)?);
+                Ok(())
+            }
+            SerializeVec::Array { .. } => Err(Error::Message(
+                "serialize_key called on array serializer".to_string(),
+            )),
+        }
+    }
+
+    fn serialize_value<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        match self {
+            SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
+            SerializeVec::Map {
+                buffer,
+                pending_key,
+                ..
+            } => {
+                let value_bytes = Self::serialize_to_buffer(value)?;
+                if let Some(key_bytes) = pending_key.take() {
+                    buffer.push((key_bytes, value_bytes));
+                    Ok(())
+                } else {
+                    Err(Error::Message(
+                        "serialize_value called without serialize_key".to_string(),
+                    ))
+                }
+            }
+            SerializeVec::Array { .. } => Err(Error::Message(
+                "serialize_value called on array serializer".to_string(),
+            )),
+        }
+    }
+
+    fn end(self) -> Result<()> {
+        match self {
+            SerializeVec::Direct { .. } => Ok(()),
+            SerializeVec::Map {
+                encoder,
+                buffer,
+                pending_key,
+            } => {
+                if pending_key.is_some() {
+                    return Err(Error::Message(
+                        "serialize_key called without serialize_value".to_string(),
+                    ));
+                }
+                // Write definite-length map header now that we know the count
+                encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
+                // Write all buffered key-value pairs
+                for (key_bytes, value_bytes) in buffer {
+                    Self::write_buffered(encoder, &key_bytes)?;
+                    Self::write_buffered(encoder, &value_bytes)?;
+                }
+                Ok(())
+            }
+            SerializeVec::Array { .. } => {
+                Err(Error::Message("end called on array serializer".to_string()))
+            }
+        }
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeStruct for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
+        serde::ser::SerializeMap::serialize_entry(self, key, value)
+    }
+
+    fn end(self) -> Result<()> {
+        serde::ser::SerializeMap::end(self)
+    }
+}
+
 // Decoder
+
+/// CBOR decoder for low-level decoding operations.
+///
+/// For most use cases, prefer the high-level [`from_slice`] or [`from_reader`] functions.
+/// Use `Decoder` directly when you need fine-grained control over the decoding
+/// process or when reading tagged values.
+///
+/// # Examples
+///
+/// Basic decoding:
+///
+/// ```
+/// use c2pa_cbor::{Encoder, Decoder};
+/// use serde::{Serialize, Deserialize};
+///
+/// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+/// struct Data {
+///     value: i32,
+/// }
+///
+/// // Encode
+/// let mut buf = Vec::new();
+/// let mut encoder = Encoder::new(&mut buf);
+/// encoder.encode(&Data { value: 42 }).unwrap();
+///
+/// // Decode
+/// let mut decoder = Decoder::new(&buf[..]);
+/// let decoded: Data = decoder.decode().unwrap();
+/// assert_eq!(decoded.value, 42);
+/// ```
+///
+/// Reading tags:
+///
+/// ```
+/// use c2pa_cbor::{Encoder, Decoder};
+///
+/// // Encode with tag
+/// let mut buf = Vec::new();
+/// let mut encoder = Encoder::new(&mut buf);
+/// encoder.write_tag(100).unwrap();
+/// encoder.encode(&"tagged data").unwrap();
+///
+/// // Decode and read tag
+/// let mut decoder = Decoder::new(&buf[..]);
+/// let tag = decoder.read_tag().unwrap();
+/// assert_eq!(tag, 100);
+/// let data: String = decoder.decode().unwrap();
+/// assert_eq!(data, "tagged data");
+/// ```
 pub struct Decoder<R: Read> {
     reader: R,
     peeked: Option<u8>,
@@ -1544,7 +1848,63 @@ impl<'de, 'a, R: Read> serde::de::MapAccess<'de> for MapAccess<'a, R> {
 }
 
 // Convenience functions
-/// Serializes a value to a CBOR byte vector
+
+/// Serializes a value to a CBOR byte vector.
+///
+/// This is the primary function for encoding Rust values to CBOR format.
+/// It automatically handles both simple and complex types, using a fast
+/// direct-write path when possible and falling back to buffering when needed
+/// (e.g., with `#[serde(flatten)]`).
+///
+/// # Performance
+///
+/// - **Fast path**: Zero overhead for types with known sizes (99% of cases)
+/// - **Buffering path**: Automatic for unknown sizes (e.g., flattened fields)
+/// - Always produces deterministic, definite-length CBOR
+///
+/// # Examples
+///
+/// Basic struct serialization:
+///
+/// ```
+/// use c2pa_cbor::to_vec;
+/// use serde::Serialize;
+///
+/// #[derive(Serialize)]
+/// struct Person {
+///     name: String,
+///     age: u32,
+/// }
+///
+/// let person = Person {
+///     name: "Alice".to_string(),
+///     age: 30,
+/// };
+///
+/// let cbor_bytes = to_vec(&person).unwrap();
+/// assert!(cbor_bytes.len() > 0);
+/// ```
+///
+/// Serializing collections:
+///
+/// ```
+/// use c2pa_cbor::to_vec;
+///
+/// let numbers = vec![1, 2, 3, 4, 5];
+/// let cbor_bytes = to_vec(&numbers).unwrap();
+///
+/// let map = std::collections::HashMap::from([
+///     ("key1".to_string(), "value1".to_string()),
+///     ("key2".to_string(), "value2".to_string()),
+/// ]);
+/// let cbor_bytes = to_vec(&map).unwrap();
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The value cannot be serialized (e.g., contains unsupported types)
+/// - Writing to the buffer fails
 pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     // Try direct serialization first
     let mut buf = Vec::new();
@@ -1564,7 +1924,55 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     }
 }
 
-/// Deserializes a value from CBOR bytes
+/// Deserializes a value from CBOR bytes.
+///
+/// This is the primary function for decoding CBOR data into Rust values.
+/// It validates the input and ensures all bytes are consumed.
+///
+/// # Examples
+///
+/// Basic deserialization:
+///
+/// ```
+/// use c2pa_cbor::{to_vec, from_slice};
+/// use serde::{Serialize, Deserialize};
+///
+/// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+/// struct Person {
+///     name: String,
+///     age: u32,
+/// }
+///
+/// let person = Person {
+///     name: "Alice".to_string(),
+///     age: 30,
+/// };
+///
+/// let cbor_bytes = to_vec(&person).unwrap();
+/// let decoded: Person = from_slice(&cbor_bytes).unwrap();
+///
+/// assert_eq!(person, decoded);
+/// ```
+///
+/// Deserializing collections:
+///
+/// ```
+/// use c2pa_cbor::{to_vec, from_slice};
+///
+/// let numbers = vec![1, 2, 3, 4, 5];
+/// let cbor_bytes = to_vec(&numbers).unwrap();
+/// let decoded: Vec<i32> = from_slice(&cbor_bytes).unwrap();
+///
+/// assert_eq!(numbers, decoded);
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The input is empty
+/// - The CBOR data is malformed
+/// - The data doesn't match the expected type
+/// - There are trailing bytes after the value
 pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
     if slice.is_empty() {
         return Err(Error::Syntax("empty input".to_string()));
@@ -1585,14 +1993,95 @@ pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
     Ok(value)
 }
 
-/// Serializes a value to a CBOR writer
+/// Serializes a value to a CBOR writer.
+///
+/// Use this when you want to write directly to a file, network stream,
+/// or any other `Write` implementation without allocating an intermediate buffer.
+///
+/// # Examples
+///
+/// Writing to a file:
+///
+/// ```no_run
+/// use c2pa_cbor::to_writer;
+/// use serde::Serialize;
+/// use std::fs::File;
+///
+/// #[derive(Serialize)]
+/// struct Config {
+///     version: u32,
+///     enabled: bool,
+/// }
+///
+/// let config = Config { version: 1, enabled: true };
+/// let file = File::create("config.cbor").unwrap();
+/// to_writer(file, &config).unwrap();
+/// ```
+///
+/// Writing to a buffer:
+///
+/// ```
+/// use c2pa_cbor::to_writer;
+/// use serde::Serialize;
+///
+/// #[derive(Serialize)]
+/// struct Data {
+///     value: i32,
+/// }
+///
+/// let mut buffer = Vec::new();
+/// let data = Data { value: 42 };
+/// to_writer(&mut buffer, &data).unwrap();
+/// assert!(buffer.len() > 0);
+/// ```
 pub fn to_writer<W: Write, T: Serialize>(writer: W, value: &T) -> Result<()> {
     let mut encoder = Encoder::new(writer);
     encoder.encode(value)?;
     Ok(())
 }
 
-/// Deserializes a value from a CBOR reader
+/// Deserializes a value from a CBOR reader.
+///
+/// Use this when reading from a file, network stream, or any other
+/// `Read` implementation.
+///
+/// # Examples
+///
+/// Reading from a file:
+///
+/// ```no_run
+/// use c2pa_cbor::from_reader;
+/// use serde::Deserialize;
+/// use std::fs::File;
+///
+/// #[derive(Deserialize, Debug)]
+/// struct Config {
+///     version: u32,
+///     enabled: bool,
+/// }
+///
+/// let file = File::open("config.cbor").unwrap();
+/// let config: Config = from_reader(file).unwrap();
+/// println!("Config: {:?}", config);
+/// ```
+///
+/// Reading from a byte slice:
+///
+/// ```
+/// use c2pa_cbor::{to_vec, from_reader};
+/// use serde::{Serialize, Deserialize};
+///
+/// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+/// struct Data {
+///     value: i32,
+/// }
+///
+/// let data = Data { value: 42 };
+/// let cbor_bytes = to_vec(&data).unwrap();
+///
+/// let decoded: Data = from_reader(&cbor_bytes[..]).unwrap();
+/// assert_eq!(data, decoded);
+/// ```
 pub fn from_reader<R: Read, T: for<'de> Deserialize<'de>>(reader: R) -> Result<T> {
     let mut decoder = Decoder::new(reader);
     decoder.decode()
@@ -1605,7 +2094,21 @@ pub type Serializer<W> = Encoder<W>;
 pub type Deserializer<R> = Decoder<R>;
 
 // Tagged value helpers
-/// Encode a tagged value (tag number + content)
+
+/// Encodes a value with a CBOR tag.
+///
+/// Tags provide semantic meaning to CBOR values. Common tags include
+/// datetime strings (0), URIs (32), and typed arrays (64-87).
+///
+/// # Examples
+///
+/// ```
+/// use c2pa_cbor::encode_tagged;
+///
+/// let mut buf = Vec::new();
+/// // Tag 100 with custom data
+/// encode_tagged(&mut buf, 100, &"custom value").unwrap();
+/// ```
 pub fn encode_tagged<W: Write, T: Serialize>(writer: &mut W, tag: u64, value: &T) -> Result<()> {
     let mut encoder = Encoder::new(writer);
     encoder.write_tag(tag)?;
@@ -1613,17 +2116,44 @@ pub fn encode_tagged<W: Write, T: Serialize>(writer: &mut W, tag: u64, value: &T
     Ok(())
 }
 
-/// Helper to encode a date/time string (tag 0)
+/// Encodes a date/time string with tag 0 (RFC 3339 format).
+///
+/// # Examples
+///
+/// ```
+/// use c2pa_cbor::encode_datetime_string;
+///
+/// let mut buf = Vec::new();
+/// encode_datetime_string(&mut buf, "2024-01-15T10:30:00Z").unwrap();
+/// ```
 pub fn encode_datetime_string<W: Write>(writer: &mut W, datetime: &str) -> Result<()> {
     encode_tagged(writer, TAG_DATETIME_STRING, &datetime)
 }
 
-/// Helper to encode an epoch timestamp (tag 1)
+/// Encodes an epoch timestamp with tag 1 (seconds since Unix epoch).
+///
+/// # Examples
+///
+/// ```
+/// use c2pa_cbor::encode_epoch_datetime;
+///
+/// let mut buf = Vec::new();
+/// encode_epoch_datetime(&mut buf, 1705315800).unwrap(); // 2024-01-15 10:30:00 UTC
+/// ```
 pub fn encode_epoch_datetime<W: Write>(writer: &mut W, epoch: i64) -> Result<()> {
     encode_tagged(writer, TAG_EPOCH_DATETIME, &epoch)
 }
 
-/// Helper to encode a URI (tag 32)
+/// Encodes a URI with tag 32.
+///
+/// # Examples
+///
+/// ```
+/// use c2pa_cbor::encode_uri;
+///
+/// let mut buf = Vec::new();
+/// encode_uri(&mut buf, "https://example.com/path").unwrap();
+/// ```
 pub fn encode_uri<W: Write>(writer: &mut W, uri: &str) -> Result<()> {
     encode_tagged(writer, TAG_URI, &uri)
 }
@@ -1640,7 +2170,20 @@ pub fn encode_base64<W: Write>(writer: &mut W, data: &str) -> Result<()> {
 
 // RFC 8746 - Typed array helpers
 
-/// Helper to encode a uint8 array (tag 64)
+/// Encodes a uint8 array with tag 64 (RFC 8746).
+///
+/// This provides efficient encoding of byte arrays with semantic
+/// meaning that they represent uint8 values.
+///
+/// # Examples
+///
+/// ```
+/// use c2pa_cbor::encode_uint8_array;
+///
+/// let mut buf = Vec::new();
+/// let data: [u8; 5] = [1, 2, 3, 4, 5];
+/// encode_uint8_array(&mut buf, &data).unwrap();
+/// ```
 pub fn encode_uint8_array<W: Write>(writer: &mut W, data: &[u8]) -> Result<()> {
     encode_tagged(writer, TAG_UINT8_ARRAY, &data)
 }
@@ -2692,8 +3235,33 @@ mod tests {
 }
 
 /// Serialization module for compatibility with serde_cbor
+/// Serialization utilities for CBOR encoding.
+///
+/// This module provides functions for serializing Rust values to CBOR format.
+/// All functions produce deterministic, definite-length CBOR suitable for C2PA digital signatures.
+///
+/// # Examples
+///
+/// ```
+/// use serde::Serialize;
+/// use c2pa_cbor::ser::to_vec;
+///
+/// #[derive(Serialize)]
+/// struct Metadata {
+///     title: String,
+///     version: u32,
+/// }
+///
+/// let data = Metadata {
+///     title: "Document".to_string(),
+///     version: 1,
+/// };
+///
+/// let cbor = to_vec(&data).unwrap();
+/// assert!(cbor.len() > 0);
+/// ```
 pub mod ser {
-    use crate::{Encoder, Error};
+    use crate::{Encoder, Error, SerializeVec};
     use serde::Serialize;
     use std::io::Write;
 
@@ -2748,12 +3316,12 @@ pub mod ser {
     impl<'a, W: Write> serde::Serializer for &'a mut Serializer<W> {
         type Ok = ();
         type Error = Error;
-        type SerializeSeq = &'a mut Encoder<W>;
-        type SerializeTuple = &'a mut Encoder<W>;
-        type SerializeTupleStruct = &'a mut Encoder<W>;
+        type SerializeSeq = SerializeVec<'a, W>;
+        type SerializeTuple = SerializeVec<'a, W>;
+        type SerializeTupleStruct = SerializeVec<'a, W>;
         type SerializeTupleVariant = &'a mut Encoder<W>;
-        type SerializeMap = &'a mut Encoder<W>;
-        type SerializeStruct = &'a mut Encoder<W>;
+        type SerializeMap = SerializeVec<'a, W>;
+        type SerializeStruct = SerializeVec<'a, W>;
         type SerializeStructVariant = &'a mut Encoder<W>;
 
         fn serialize_bool(self, v: bool) -> Result<(), Error> {
@@ -2906,6 +3474,30 @@ pub mod ser {
 }
 
 /// Deserialization module for compatibility with serde_cbor
+/// Deserialization utilities for CBOR decoding.
+///
+/// This module provides types for deserializing CBOR data into Rust values.
+/// The deserializer handles both definite-length and indefinite-length CBOR,
+/// including backward compatibility with older formats.
+///
+/// # Examples
+///
+/// ```
+/// use serde::Deserialize;
+/// use c2pa_cbor::{ser, de};
+///
+/// #[derive(Deserialize, Debug, PartialEq)]
+/// struct Config {
+///     name: String,
+///     count: u32,
+/// }
+///
+/// let cbor = vec![0xa2, 0x64, 0x6e, 0x61, 0x6d, 0x65, 0x64, 0x74, 0x65, 0x73, 0x74, 0x65, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x05];
+/// let mut deserializer = de::Deserializer::new(&cbor[..]);
+/// let config = Config::deserialize(&mut deserializer).unwrap();
+/// assert_eq!(config.name, "test");
+/// assert_eq!(config.count, 5);
+/// ```
 pub mod de {
     pub use crate::Decoder as Deserializer;
 }

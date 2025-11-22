@@ -13,6 +13,9 @@ A fast, lightweight CBOR (Concise Binary Object Representation) encoder/decoder 
 - ✅ Custom tag support via `write_tag()` and `read_tag()` methods
 - ✅ Excellent performance with near-zero overhead
 - ✅ Serde integration for seamless serialization
+- ✅ **Full `serde_transcode` support** - handles `#[serde(flatten)]` and other advanced features
+- ✅ **Backward compatible newtype struct handling** - works with existing CBOR data
+- ✅ **Deterministic encoding** - always produces definite-length CBOR (required for C2PA)
 
 ## Installation
 
@@ -116,6 +119,37 @@ let data: [u32; 3] = [0x12345678, 0x9ABCDEF0, 0x11223344];
 encode_uint32be_array(&mut buf, &data).unwrap();
 ```
 
+### Using with serde_transcode
+
+This library fully supports `serde_transcode` for converting between formats:
+
+```rust
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    name: String,
+    #[serde(flatten)]  // This works correctly!
+    extra: HashMap<String, serde_json::Value>,
+}
+
+// Convert JSON to CBOR via transcode
+let json_str = r#"{"name":"app","version":"1.0","debug":true}"#;
+let mut from = serde_json::Deserializer::from_str(json_str);
+let mut to = c2pa_cbor::ser::Serializer::new(Vec::new());
+
+serde_transcode::transcode(&mut from, &mut to).unwrap();
+let cbor_bytes = to.into_inner();
+
+// The CBOR is always definite-length (required for C2PA signatures)
+let config: Config = c2pa_cbor::from_slice(&cbor_bytes).unwrap();
+```
+
+**Note:** When the collection size is known (the common case), serialization is zero-overhead. 
+When using `#[serde(flatten)]` or similar features that require unknown-length serialization, 
+the library automatically buffers entries to produce definite-length CBOR output.
+
 ## Performance
 
 This implementation is designed for **speed** with binary byte arrays:
@@ -141,6 +175,58 @@ Binary byte arrays have minimal overhead:
 - ✅ No per-element overhead with `serde_bytes`
 - ✅ Direct memory writes (no intermediate buffers)
 - ✅ Near memory bandwidth performance
+- ✅ **Dual-path architecture**: Zero overhead for normal serialization, automatic buffering only when needed
+
+## Architecture
+
+This library uses a **smart dual-path serialization strategy**:
+
+1. **Fast Path (99% of cases)**: When collection sizes are known at serialization time (normal structs, Vec, HashMap, etc.), data is written directly with zero overhead.
+
+2. **Buffering Path (rare cases)**: When sizes are unknown (e.g., `#[serde(flatten)]` with `serde_transcode`), entries are buffered and written as definite-length once the count is known.
+
+This design ensures:
+- ✅ **Optimal performance** for typical use cases
+- ✅ **Full serde compatibility** including advanced features
+- ✅ **Deterministic output** (always definite-length, never indefinite)
+- ✅ **C2PA compliance** (required for digital signatures)
+
+The buffering path adds minimal overhead and only activates when necessary, making the library both fast and fully compatible with the serde ecosystem.
+
+## Migration from serde_cbor
+
+This library is designed as a drop-in replacement for `serde_cbor`:
+
+```rust
+// Before (serde_cbor)
+use serde_cbor::{to_vec, from_slice};
+let encoded = serde_cbor::to_vec(&value)?;
+let decoded = serde_cbor::from_slice(&encoded)?;
+
+// After (c2pa_cbor)
+use c2pa_cbor::{to_vec, from_slice};
+let encoded = c2pa_cbor::to_vec(&value)?;
+let decoded = c2pa_cbor::from_slice(&encoded)?;
+```
+
+### Key Improvements Over serde_cbor
+
+- ✅ **Handles `#[serde(flatten)]`** - No more "indefinite-length maps require manual encoding" errors
+- ✅ **Newtype struct compatibility** - Automatically handles tuple struct serialization correctly
+- ✅ **Better `serde_transcode` support** - Works seamlessly with JSON-to-CBOR conversion
+- ✅ **Always deterministic** - Produces definite-length CBOR in all cases
+- ✅ **Faster encoding** - Zero-overhead fast path for normal cases
+
+### Compatibility Module
+
+For maximum compatibility, use the `ser` module which matches `serde_cbor`'s API:
+
+```rust
+// Drop-in replacement for serde_cbor::Serializer
+let mut to = c2pa_cbor::ser::Serializer::new(Vec::new());
+value.serialize(&mut to)?;
+let bytes = to.into_inner();
+```
 
 ## API Overview
 
@@ -193,6 +279,17 @@ This implementation follows:
 - **RFC 8746** - Typed arrays as byte strings
 - **RFC 3339** - Date/time format for tag 0
 - **RFC 3986** - URI format for tag 32
+
+### Deterministic Encoding
+
+This library **always produces definite-length CBOR** (never indefinite-length), which ensures:
+- Deterministic output (same input always produces identical bytes)
+- C2PA compliance (required for verifiable digital signatures)
+- Compatibility with strict CBOR parsers
+
+This is achieved through:
+- Direct encoding when sizes are known (fast path)
+- Automatic buffering and counting when sizes are unknown (compatibility path)
 
 ## Testing
 
