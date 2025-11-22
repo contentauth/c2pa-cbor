@@ -411,3 +411,44 @@ fn test_transparent_newtype() {
 
     assert_eq!(wrapper, deserialized);
 }
+
+#[test]
+fn test_transcode_from_json_with_flatten() {
+    // Tests serde_transcode with #[serde(flatten)] which causes indefinite-length maps
+    // This was causing "indefinite-length maps require manual encoding" errors
+    use serde_json;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct WithFlatten {
+        name: String,
+        #[serde(flatten)]
+        extra: HashMap<String, serde_json::Value>,
+    }
+
+    let json_str = r#"{"name":"test","param1":"value1","param2":42,"param3":true}"#;
+
+    // Transcode from JSON to CBOR using ser::Serializer
+    let buf: Vec<u8> = Vec::new();
+    let mut from = serde_json::Deserializer::from_str(json_str);
+    let mut to = c2pa_cbor::ser::Serializer::new(buf);
+
+    serde_transcode::transcode(&mut from, &mut to).expect("transcode should work with flatten");
+
+    let cbor_bytes = to.into_inner();
+
+    // Verify it deserializes correctly
+    let decoded: WithFlatten = c2pa_cbor::from_slice(&cbor_bytes).expect("deserialize");
+    assert_eq!(decoded.name, "test");
+    assert_eq!(
+        decoded.extra.get("param1").and_then(|v| v.as_str()),
+        Some("value1")
+    );
+    assert_eq!(
+        decoded.extra.get("param2").and_then(|v| v.as_i64()),
+        Some(42)
+    );
+    assert_eq!(
+        decoded.extra.get("param3").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}

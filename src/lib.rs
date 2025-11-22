@@ -260,16 +260,33 @@ impl<W: Write> Encoder<W> {
     }
 }
 
+/// Wrapper for serializing sequences/maps with optional buffering
+/// When length is known, writes directly; when unknown, buffers entries
+pub enum SerializeVec<'a, W: Write> {
+    Direct {
+        encoder: &'a mut Encoder<W>,
+    },
+    Array {
+        encoder: &'a mut Encoder<W>,
+        buffer: Vec<Vec<u8>>,
+    },
+    Map {
+        encoder: &'a mut Encoder<W>,
+        buffer: Vec<(Vec<u8>, Vec<u8>)>,
+        pending_key: Option<Vec<u8>>,
+    },
+}
+
 impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     type Ok = ();
     type Error = crate::Error;
-    type SerializeSeq = Self;
-    type SerializeTuple = Self;
-    type SerializeTupleStruct = Self;
-    type SerializeTupleVariant = Self;
-    type SerializeMap = Self;
-    type SerializeStruct = Self;
-    type SerializeStructVariant = Self;
+    type SerializeSeq = SerializeVec<'a, W>;
+    type SerializeTuple = SerializeVec<'a, W>;
+    type SerializeTupleStruct = SerializeVec<'a, W>;
+    type SerializeTupleVariant = &'a mut Encoder<W>;
+    type SerializeMap = SerializeVec<'a, W>;
+    type SerializeStruct = SerializeVec<'a, W>;
+    type SerializeStructVariant = &'a mut Encoder<W>;
 
     fn serialize_bool(self, v: bool) -> Result<()> {
         let val = if v { TRUE } else { FALSE };
@@ -394,19 +411,19 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
-        // Note: Indefinite-length arrays are supported via manual encoding
-        // (write_array_indefinite + elements + write_break), but not through
-        // serde's automatic serialization since we can't track state to write
-        // the break marker in SerializeSeq::end()
         match len {
-            Some(len) => self.write_type_value(MAJOR_ARRAY, len as u64)?,
+            Some(len) => {
+                self.write_type_value(MAJOR_ARRAY, len as u64)?;
+                Ok(SerializeVec::Direct { encoder: self })
+            }
             None => {
-                return Err(Error::Message(
-                    "indefinite-length sequences require manual encoding".to_string(),
-                ));
+                // Unknown length - buffer elements
+                Ok(SerializeVec::Array {
+                    encoder: self,
+                    buffer: Vec::new(),
+                })
             }
         }
-        Ok(self)
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
@@ -439,17 +456,16 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
             Some(len) => {
                 // Definite-length map: write size immediately
                 self.write_type_value(MAJOR_MAP, len as u64)?;
-                Ok(self)
+                Ok(SerializeVec::Direct { encoder: self })
             }
             None => {
-                // Indefinite-length map requested - this happens when:
-                // 1. Serializing a type with #[serde(flatten)]
-                // 2. Serializing a custom iterator without ExactSizeIterator
-                // 3. Some custom Serialize implementations
-                // We return an error here, and to_vec() will catch it and fall back to Value serialization
-                Err(Error::Message(
-                    "indefinite-length maps require manual encoding".to_string(),
-                ))
+                // Indefinite-length map requested (e.g., from #[serde(flatten)])
+                // Buffer key-value pairs until end
+                Ok(SerializeVec::Map {
+                    encoder: self,
+                    buffer: Vec::new(),
+                    pending_key: None,
+                })
             }
         }
     }
@@ -579,6 +595,174 @@ impl<'a, W: Write> serde::ser::SerializeStructVariant for &'a mut Encoder<W> {
 
     fn end(self) -> Result<()> {
         Ok(())
+    }
+}
+
+// Implementations for SerializeVec (handles buffering for unknown-length collections)
+
+impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        match self {
+            SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
+            SerializeVec::Array { buffer, .. } => {
+                let mut element_buf = Vec::new();
+                let mut element_encoder = Encoder::new(&mut element_buf);
+                value.serialize(&mut element_encoder)?;
+                buffer.push(element_buf);
+                Ok(())
+            }
+            SerializeVec::Map { .. } => Err(Error::Message(
+                "serialize_element called on map serializer".to_string(),
+            )),
+        }
+    }
+
+    fn end(self) -> Result<()> {
+        match self {
+            SerializeVec::Direct { .. } => Ok(()),
+            SerializeVec::Array { encoder, buffer } => {
+                // Write definite-length array header now that we know the count
+                encoder.write_type_value(MAJOR_ARRAY, buffer.len() as u64)?;
+                // Write all buffered elements
+                for element_bytes in buffer {
+                    encoder.writer.write_all(&element_bytes)?;
+                }
+                Ok(())
+            }
+            SerializeVec::Map { .. } => {
+                Err(Error::Message("end called on map serializer".to_string()))
+            }
+        }
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeTuple for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<()> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeTupleStruct for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<()> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_key<T>(&mut self, key: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        match self {
+            SerializeVec::Direct { encoder } => key.serialize(&mut **encoder),
+            SerializeVec::Map { pending_key, .. } => {
+                let mut key_buf = Vec::new();
+                let mut key_encoder = Encoder::new(&mut key_buf);
+                key.serialize(&mut key_encoder)?;
+                *pending_key = Some(key_buf);
+                Ok(())
+            }
+            SerializeVec::Array { .. } => Err(Error::Message(
+                "serialize_key called on array serializer".to_string(),
+            )),
+        }
+    }
+
+    fn serialize_value<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: ?Sized + Serialize,
+    {
+        match self {
+            SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
+            SerializeVec::Map {
+                buffer,
+                pending_key,
+                ..
+            } => {
+                let mut value_buf = Vec::new();
+                let mut value_encoder = Encoder::new(&mut value_buf);
+                value.serialize(&mut value_encoder)?;
+                if let Some(key_bytes) = pending_key.take() {
+                    buffer.push((key_bytes, value_buf));
+                    Ok(())
+                } else {
+                    Err(Error::Message(
+                        "serialize_value called without serialize_key".to_string(),
+                    ))
+                }
+            }
+            SerializeVec::Array { .. } => Err(Error::Message(
+                "serialize_value called on array serializer".to_string(),
+            )),
+        }
+    }
+
+    fn end(self) -> Result<()> {
+        match self {
+            SerializeVec::Direct { .. } => Ok(()),
+            SerializeVec::Map {
+                encoder,
+                buffer,
+                pending_key,
+            } => {
+                if pending_key.is_some() {
+                    return Err(Error::Message(
+                        "serialize_key called without serialize_value".to_string(),
+                    ));
+                }
+                // Write definite-length map header now that we know the count
+                encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
+                // Write all buffered key-value pairs
+                for (key_bytes, value_bytes) in buffer {
+                    encoder.writer.write_all(&key_bytes)?;
+                    encoder.writer.write_all(&value_bytes)?;
+                }
+                Ok(())
+            }
+            SerializeVec::Array { .. } => {
+                Err(Error::Message("end called on array serializer".to_string()))
+            }
+        }
+    }
+}
+
+impl<'a, W: Write> serde::ser::SerializeStruct for SerializeVec<'a, W> {
+    type Ok = ();
+    type Error = crate::Error;
+
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
+        serde::ser::SerializeMap::serialize_entry(self, key, value)
+    }
+
+    fn end(self) -> Result<()> {
+        serde::ser::SerializeMap::end(self)
     }
 }
 
@@ -2693,7 +2877,7 @@ mod tests {
 
 /// Serialization module for compatibility with serde_cbor
 pub mod ser {
-    use crate::{Encoder, Error};
+    use crate::{Encoder, Error, SerializeVec};
     use serde::Serialize;
     use std::io::Write;
 
@@ -2748,12 +2932,12 @@ pub mod ser {
     impl<'a, W: Write> serde::Serializer for &'a mut Serializer<W> {
         type Ok = ();
         type Error = Error;
-        type SerializeSeq = &'a mut Encoder<W>;
-        type SerializeTuple = &'a mut Encoder<W>;
-        type SerializeTupleStruct = &'a mut Encoder<W>;
+        type SerializeSeq = SerializeVec<'a, W>;
+        type SerializeTuple = SerializeVec<'a, W>;
+        type SerializeTupleStruct = SerializeVec<'a, W>;
         type SerializeTupleVariant = &'a mut Encoder<W>;
-        type SerializeMap = &'a mut Encoder<W>;
-        type SerializeStruct = &'a mut Encoder<W>;
+        type SerializeMap = SerializeVec<'a, W>;
+        type SerializeStruct = SerializeVec<'a, W>;
         type SerializeStructVariant = &'a mut Encoder<W>;
 
         fn serialize_bool(self, v: bool) -> Result<(), Error> {
