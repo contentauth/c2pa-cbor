@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::{Error, Result};
 use serde::Deserialize;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 
 pub struct Decoder<R: Read> {
     reader: R,
@@ -964,16 +964,19 @@ impl<'de, 'a, R: Read> serde::de::MapAccess<'de> for MapAccess<'a, R> {
 }
 
 /// Deserializes a value from CBOR bytes
+///
+/// Uses Cursor for optimized slice reading performance
 pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
     if slice.is_empty() {
         return Err(Error::Syntax("empty input".to_string()));
     }
 
-    let mut decoder = Decoder::new(slice);
+    // Wrap in Cursor for better performance with small reads
+    let mut decoder = Decoder::new(Cursor::new(slice));
     let value = decoder.decode()?;
 
     // Check if all bytes were consumed
-    let remaining = decoder.reader.len();
+    let remaining = slice.len() as u64 - decoder.reader.position();
     if remaining > 0 {
         return Err(Error::Syntax(format!(
             "unexpected trailing data: {} bytes remaining",
