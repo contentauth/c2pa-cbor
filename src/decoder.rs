@@ -6,6 +6,7 @@ use std::io::{BufReader, Cursor, Read};
 pub struct Decoder<R: Read> {
     reader: R,
     peeked: Option<u8>,
+    max_allocation: Option<usize>,
 }
 
 impl<R: Read> Decoder<R> {
@@ -13,7 +14,48 @@ impl<R: Read> Decoder<R> {
         Decoder {
             reader,
             peeked: None,
+            max_allocation: None, // Default: no artificial limit, rely on try_reserve
         }
+    }
+
+    /// Create a decoder with a maximum allocation size limit
+    /// 
+    /// This provides defense-in-depth against malicious CBOR with extremely large
+    /// length fields. Even if this limit is bypassed, try_reserve will still
+    /// prevent OOM by respecting system memory limits.
+    pub fn with_max_allocation(reader: R, max_bytes: usize) -> Self {
+        Decoder {
+            reader,
+            peeked: None,
+            max_allocation: Some(max_bytes),
+        }
+    }
+
+    /// Try to allocate a buffer of the given size
+    /// 
+    /// This checks the configured maximum first, then uses try_reserve to
+    /// respect actual system memory limits (ulimit, Docker, cgroups, etc.)
+    fn try_allocate(&self, size: usize) -> Result<Vec<u8>> {
+        // Check user-defined limit first (if set)
+        if let Some(max) = self.max_allocation {
+            if size > max {
+                return Err(Error::Syntax(format!(
+                    "Allocation size {} bytes exceeds maximum {} bytes",
+                    size, max
+                )));
+            }
+        }
+
+        // Try to actually allocate - respects system limits
+        let mut buf = Vec::new();
+        buf.try_reserve(size).map_err(|_| {
+            Error::Syntax(format!(
+                "Cannot allocate {} bytes (out of memory)",
+                size
+            ))
+        })?;
+        buf.resize(size, 0);
+        Ok(buf)
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -195,7 +237,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
             MAJOR_BYTES => {
                 match self.read_length(info)? {
                     Some(len) => {
-                        let mut buf = vec![0u8; len as usize];
+                        let mut buf = self.try_allocate(len as usize)?;
                         self.reader.read_exact(&mut buf)?;
                         visitor.visit_byte_buf(buf)
                     }
@@ -223,7 +265,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                                         .to_string(),
                                 )
                             })?;
-                            let mut chunk = vec![0u8; len as usize];
+                            let mut chunk = self.try_allocate(len as usize)?;
                             self.reader.read_exact(&mut chunk)?;
                             result.extend_from_slice(&chunk);
                         }
@@ -234,7 +276,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
             MAJOR_TEXT => {
                 match self.read_length(info)? {
                     Some(len) => {
-                        let mut buf = vec![0u8; len as usize];
+                        let mut buf = self.try_allocate(len as usize)?;
                         self.reader.read_exact(&mut buf)?;
                         let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
                         visitor.visit_string(s)
@@ -263,7 +305,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                                         .to_string(),
                                 )
                             })?;
-                            let mut chunk_buf = vec![0u8; len as usize];
+                            let mut chunk_buf = self.try_allocate(len as usize)?;
                             self.reader.read_exact(&mut chunk_buf)?;
                             let chunk =
                                 String::from_utf8(chunk_buf).map_err(|_| Error::InvalidUtf8)?;
@@ -435,7 +477,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
             MAJOR_BYTES => {
                 match self.read_length(info)? {
                     Some(len) => {
-                        let mut buf = vec![0u8; len as usize];
+                        let mut buf = self.try_allocate(len as usize)?;
                         self.reader.read_exact(&mut buf)?;
                         visitor.visit_byte_buf(buf)
                     }
@@ -463,7 +505,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                                         .to_string(),
                                 )
                             })?;
-                            let mut chunk = vec![0u8; len as usize];
+                            let mut chunk = self.try_allocate(len as usize)?;
                             self.reader.read_exact(&mut chunk)?;
                             result.extend_from_slice(&chunk);
                         }
@@ -474,7 +516,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
             MAJOR_TEXT => {
                 match self.read_length(info)? {
                     Some(len) => {
-                        let mut buf = vec![0u8; len as usize];
+                        let mut buf = self.try_allocate(len as usize)?;
                         self.reader.read_exact(&mut buf)?;
                         let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
                         visitor.visit_string(s)
@@ -503,7 +545,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                                         .to_string(),
                                 )
                             })?;
-                            let mut chunk_buf = vec![0u8; len as usize];
+                            let mut chunk_buf = self.try_allocate(len as usize)?;
                             self.reader.read_exact(&mut chunk_buf)?;
                             let chunk =
                                 String::from_utf8(chunk_buf).map_err(|_| Error::InvalidUtf8)?;
@@ -652,7 +694,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                     let len = self.read_length(info)?.ok_or_else(|| {
                         Error::Syntax("Text in newtype must be definite length".to_string())
                     })?;
-                    let mut buf = vec![0u8; len as usize];
+                    let mut buf = self.try_allocate(len as usize)?;
                     self.reader.read_exact(&mut buf)?;
                     let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
                     visitor.visit_newtype_struct(StringDeserializer { value: s })
@@ -748,7 +790,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 let len = self.de.read_length(self.info)?.ok_or_else(|| {
                     Error::Syntax("Text in option must be definite length".to_string())
                 })?;
-                let mut buf = vec![0u8; len as usize];
+                let mut buf = self.de.try_allocate(len as usize)?;
                 self.de.reader.read_exact(&mut buf)?;
                 let s = String::from_utf8(buf).map_err(|_| Error::InvalidUtf8)?;
                 visitor.visit_string(s)
@@ -757,7 +799,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 let len = self.de.read_length(self.info)?.ok_or_else(|| {
                     Error::Syntax("Bytes in option must be definite length".to_string())
                 })?;
-                let mut buf = vec![0u8; len as usize];
+                let mut buf = self.de.try_allocate(len as usize)?;
                 self.de.reader.read_exact(&mut buf)?;
                 visitor.visit_byte_buf(buf)
             }
@@ -994,4 +1036,43 @@ pub fn from_slice<'de, T: Deserialize<'de>>(slice: &[u8]) -> Result<T> {
 pub fn from_reader<R: Read, T: for<'de> Deserialize<'de>>(reader: R) -> Result<T> {
     let mut decoder = Decoder::new(BufReader::new(reader));
     decoder.decode()
+}
+
+/// Deserializes a value from a CBOR reader with a maximum allocation limit
+///
+/// This is useful for untrusted input to prevent DoS attacks via extremely
+/// large CBOR values. Even without this limit, try_reserve provides system-level
+/// protection, but this adds an application-level safety check.
+pub fn from_reader_with_limit<R: Read, T: for<'de> Deserialize<'de>>(
+    reader: R,
+    max_bytes: usize,
+) -> Result<T> {
+    let mut decoder = Decoder::with_max_allocation(BufReader::new(reader), max_bytes);
+    decoder.decode()
+}
+
+/// Deserializes a value from CBOR bytes with a maximum allocation limit
+///
+/// This is useful for untrusted input to prevent DoS attacks via extremely
+/// large CBOR values. Even without this limit, try_reserve provides system-level
+/// protection, but this adds an application-level safety check.
+pub fn from_slice_with_limit<'de, T: Deserialize<'de>>(slice: &[u8], max_bytes: usize) -> Result<T> {
+    if slice.is_empty() {
+        return Err(Error::Syntax("empty input".to_string()));
+    }
+
+    // Wrap in Cursor for better performance with small reads
+    let mut decoder = Decoder::with_max_allocation(Cursor::new(slice), max_bytes);
+    let value = decoder.decode()?;
+
+    // Check if all bytes were consumed
+    let remaining = slice.len() as u64 - decoder.reader.position();
+    if remaining > 0 {
+        return Err(Error::Syntax(format!(
+            "unexpected trailing data: {} bytes remaining",
+            remaining
+        )));
+    }
+
+    Ok(value)
 }

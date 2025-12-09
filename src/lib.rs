@@ -1083,4 +1083,94 @@ mod tests {
         assert!(result.is_ok(), "Should succeed on valid CBOR");
         assert_eq!(result.unwrap(), 13);
     }
+
+    #[test]
+    fn test_with_max_allocation_rejects_oversized() {
+        use crate::decoder::Decoder;
+        use crate::Value;
+        use std::io::Cursor;
+
+        // Create CBOR claiming 100MB text string
+        // 0x7b = major type 3 (text), additional info 27 (8-byte length)
+        let mut cbor = vec![0x7b];
+        let length: u64 = 100 * 1024 * 1024; // 100MB
+        cbor.extend_from_slice(&length.to_be_bytes());
+        cbor.extend_from_slice(b"attack"); // Add some data (not 100MB)
+
+        // Set limit to 10MB - should reject before attempting allocation
+        let cursor = Cursor::new(&cbor[..]);
+        let mut decoder = Decoder::with_max_allocation(cursor, 10 * 1024 * 1024);
+        let result: Result<Value> = decoder.decode();
+
+        assert!(result.is_err(), "Should reject allocation exceeding max_allocation");
+
+        // Verify error message mentions the limit
+        if let Err(e) = result {
+            let msg = format!("{:?}", e);
+            assert!(
+                msg.contains("exceeds maximum") || msg.contains("Allocation size"),
+                "Error should mention allocation limit: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_with_max_allocation_accepts_within_limit() {
+        use crate::decoder::Decoder;
+        use crate::Value;
+        use std::io::Cursor;
+
+        // Create a valid 1KB text string
+        // 0x79 = major type 3 (text), additional info 25 (2-byte length)
+        let mut cbor = vec![0x79];
+        let length: u16 = 1024;
+        cbor.extend_from_slice(&length.to_be_bytes());
+        cbor.resize(3 + 1024, b'A'); // Add 1KB of actual data
+
+        // Set limit to 10MB - should accept
+        let cursor = Cursor::new(&cbor[..]);
+        let mut decoder = Decoder::with_max_allocation(cursor, 10 * 1024 * 1024);
+        let result: Result<Value> = decoder.decode();
+
+        assert!(result.is_ok(), "Should accept allocation within max_allocation");
+
+        // Verify we got the expected string
+        if let Ok(Value::Text(s)) = result {
+            assert_eq!(s.len(), 1024, "Should decode 1KB string");
+            assert!(s.chars().all(|c| c == 'A'), "String should be all 'A's");
+        } else {
+            panic!("Expected Text value, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_with_max_allocation_byte_string() {
+        use crate::decoder::Decoder;
+        use crate::Value;
+        use std::io::Cursor;
+
+        // Test with byte string (major type 2) instead of text string
+        // 0x5a = major type 2 (bytes), additional info 26 (4-byte length)
+        let mut cbor = vec![0x5a];
+        let length: u32 = 50 * 1024 * 1024; // 50MB
+        cbor.extend_from_slice(&length.to_be_bytes());
+        cbor.extend_from_slice(&[0xff, 0xfe]); // Add some data
+
+        // Set limit to 10MB - should reject
+        let cursor = Cursor::new(&cbor[..]);
+        let mut decoder = Decoder::with_max_allocation(cursor, 10 * 1024 * 1024);
+        let result: Result<Value> = decoder.decode();
+
+        assert!(result.is_err(), "Should reject byte string exceeding limit");
+
+        if let Err(e) = result {
+            let msg = format!("{:?}", e);
+            assert!(
+                msg.contains("exceeds maximum") || msg.contains("Allocation size"),
+                "Error should mention allocation limit for byte string: {}",
+                msg
+            );
+        }
+    }
 }
