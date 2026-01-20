@@ -7,29 +7,29 @@ This document describes the benchmark suite for the c2pa_cbor library.
 To run all benchmarks:
 
 ```bash
-cargo bench -p c2pa_cbor
+cargo bench
 ```
 
 To run a specific benchmark group:
 
 ```bash
 # Byte array performance
-cargo bench -p c2pa_cbor --bench cbor_perf -- byte_arrays
+cargo bench --bench cbor_perf -- byte_arrays
 
 # Structured data
-cargo bench -p c2pa_cbor --bench cbor_perf -- structured_data
+cargo bench --bench cbor_perf -- structured_data
 
 # Collections (Vec, HashMap)
-cargo bench -p c2pa_cbor --bench cbor_perf -- collections
+cargo bench --bench cbor_perf -- collections
 
 # Option handling
-cargo bench -p c2pa_cbor --bench cbor_perf -- option_handling
+cargo bench --bench cbor_perf -- option_handling
 
 # Flatten attribute
-cargo bench -p c2pa_cbor --bench cbor_perf -- flatten
+cargo bench --bench cbor_perf -- flatten
 
 # Nested structures
-cargo bench -p c2pa_cbor --bench cbor_perf -- nested
+cargo bench --bench cbor_perf -- nested
 ```
 
 ## Benchmark Categories
