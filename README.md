@@ -292,4 +292,12 @@ This is achieved through:
 - Automatic buffering and counting when sizes are unknown (compatibility path)
 
 
+## Contributions and feedback
 
+We welcome contributions to this project.  For information on contributing, providing feedback, and about ongoing work, see [Contributing](https://github.com/contentauth/c2pa-rs/blob/main/CONTRIBUTING.md).  For additional information on testing, see [Contributing to the project](https://github.com/contentauth/c2pa-rs/blob/main/docs/project-contributions.md).
+
+## License
+
+The `c2pa` crate is distributed under the terms of both the [MIT license](https://github.com/contentauth/c2pa-rs/blob/main/LICENSE-MIT) and the [Apache License (Version 2.0)](https://github.com/contentauth/c2pa-rs/blob/main/LICENSE-APACHE).
+
+Some components and dependent crates are licensed under different terms; please check their licenses for details.
