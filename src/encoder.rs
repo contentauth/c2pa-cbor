@@ -1,7 +1,23 @@
-use crate::constants::*;
-use crate::{Error, Result};
-use serde::Serialize;
+// Copyright 2025 Adobe. All rights reserved.
+// This file is licensed to you under the Apache License,
+// Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+// or the MIT license (http://opensource.org/licenses/MIT),
+// at your option.
+
+// Unless required by applicable law or agreed to in writing,
+// this software is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR REPRESENTATIONS OF ANY KIND, either express or
+// implied. See the LICENSE-MIT and LICENSE-APACHE files for the
+// specific language governing permissions and limitations under
+// each license.
+
+// Portions derived from serde_cbor (https://github.com/pyfisch/cbor)
+
 use std::io::Write;
+
+use serde::Serialize;
+
+use crate::{Error, Result, constants::*};
 
 // Encoder
 pub struct Encoder<W: Write> {
@@ -90,15 +106,15 @@ pub enum SerializeVec<'a, W: Write> {
 }
 
 impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
-    type Ok = ();
     type Error = crate::Error;
+    type Ok = ();
+    type SerializeMap = SerializeVec<'a, W>;
     type SerializeSeq = SerializeVec<'a, W>;
+    type SerializeStruct = SerializeVec<'a, W>;
+    type SerializeStructVariant = &'a mut Encoder<W>;
     type SerializeTuple = SerializeVec<'a, W>;
     type SerializeTupleStruct = SerializeVec<'a, W>;
     type SerializeTupleVariant = &'a mut Encoder<W>;
-    type SerializeMap = SerializeVec<'a, W>;
-    type SerializeStruct = SerializeVec<'a, W>;
-    type SerializeStructVariant = &'a mut Encoder<W>;
 
     fn serialize_bool(self, v: bool) -> Result<()> {
         let val = if v { TRUE } else { FALSE };
@@ -198,9 +214,9 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
         self.serialize_str(variant)
     }
 
-    fn serialize_newtype_struct<T: ?Sized>(self, _name: &'static str, value: &T) -> Result<()>
+    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<()>
     where
-        T: Serialize,
+        T: ?Sized + Serialize,
     {
         // Serialize as a 1-element array to maintain tuple struct semantics
         // This allows tuple structs like `struct Wrapper(Inner)` to round-trip correctly
@@ -307,9 +323,9 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeSeq for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeSeq for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         value.serialize(&mut **self)
@@ -320,9 +336,9 @@ impl<'a, W: Write> serde::ser::SerializeSeq for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeTuple for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeTuple for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         value.serialize(&mut **self)
@@ -333,9 +349,9 @@ impl<'a, W: Write> serde::ser::SerializeTuple for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeTupleStruct for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeTupleStruct for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         value.serialize(&mut **self)
@@ -346,9 +362,9 @@ impl<'a, W: Write> serde::ser::SerializeTupleStruct for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeTupleVariant for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeTupleVariant for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         value.serialize(&mut **self)
@@ -359,9 +375,9 @@ impl<'a, W: Write> serde::ser::SerializeTupleVariant for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeMap for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeMap for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<()> {
         key.serialize(&mut **self)
@@ -376,9 +392,9 @@ impl<'a, W: Write> serde::ser::SerializeMap for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeStruct for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeStruct for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
@@ -394,9 +410,9 @@ impl<'a, W: Write> serde::ser::SerializeStruct for &'a mut Encoder<W> {
     }
 }
 
-impl<'a, W: Write> serde::ser::SerializeStructVariant for &'a mut Encoder<W> {
-    type Ok = ();
+impl<W: Write> serde::ser::SerializeStructVariant for &mut Encoder<W> {
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
@@ -434,8 +450,8 @@ impl<'a, W: Write> SerializeVec<'a, W> {
 }
 
 impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
-    type Ok = ();
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_element<T>(&mut self, value: &T) -> Result<()>
     where
@@ -473,8 +489,8 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
 }
 
 impl<'a, W: Write> serde::ser::SerializeTuple for SerializeVec<'a, W> {
-    type Ok = ();
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         serde::ser::SerializeSeq::serialize_element(self, value)
@@ -486,8 +502,8 @@ impl<'a, W: Write> serde::ser::SerializeTuple for SerializeVec<'a, W> {
 }
 
 impl<'a, W: Write> serde::ser::SerializeTupleStruct for SerializeVec<'a, W> {
-    type Ok = ();
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         serde::ser::SerializeSeq::serialize_element(self, value)
@@ -499,8 +515,8 @@ impl<'a, W: Write> serde::ser::SerializeTupleStruct for SerializeVec<'a, W> {
 }
 
 impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
-    type Ok = ();
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_key<T>(&mut self, key: &T) -> Result<()>
     where
@@ -575,8 +591,8 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
 }
 
 impl<'a, W: Write> serde::ser::SerializeStruct for SerializeVec<'a, W> {
-    type Ok = ();
     type Error = crate::Error;
+    type Ok = ();
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
