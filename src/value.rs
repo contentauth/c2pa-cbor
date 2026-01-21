@@ -1,9 +1,24 @@
+// Copyright 2025 Adobe. All rights reserved.
+// This file is licensed to you under the Apache License,
+// Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+// or the MIT license (http://opensource.org/licenses/MIT),
+// at your option.
+
+// Unless required by applicable law or agreed to in writing,
+// this software is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR REPRESENTATIONS OF ANY KIND, either express or
+// implied. See the LICENSE-MIT and LICENSE-APACHE files for the
+// specific language governing permissions and limitations under
+// each license.
+
+// Portions derived from serde_cbor (https://github.com/pyfisch/cbor)
+
+use std::{collections::BTreeMap, fmt};
+
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, Visitor},
 };
-use std::collections::BTreeMap;
-use std::fmt;
 
 /// Dynamic CBOR value type for working with untyped CBOR data
 ///
@@ -12,12 +27,16 @@ use std::fmt;
 ///
 /// # Example
 /// ```
-/// use c2pa_cbor::{Value, to_vec, from_slice};
 /// use std::collections::BTreeMap;
+///
+/// use c2pa_cbor::{Value, from_slice, to_vec};
 ///
 /// // Create a dynamic value
 /// let mut map = BTreeMap::new();
-/// map.insert(Value::Text("name".to_string()), Value::Text("Alice".to_string()));
+/// map.insert(
+///     Value::Text("name".to_string()),
+///     Value::Text("Alice".to_string()),
+/// );
 /// map.insert(Value::Text("age".to_string()), Value::Integer(30));
 /// let value = Value::Map(map);
 ///
@@ -26,7 +45,7 @@ use std::fmt;
 /// let decoded: Value = from_slice(&bytes).unwrap();
 /// assert_eq!(value, decoded);
 /// ```
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// Null value
     Null,
@@ -311,12 +330,83 @@ impl Value {
     }
 }
 
-// Implement Eq and Ord for Value to allow it to be used as a map key
+// Implement Eq, PartialOrd, and Ord for Value to allow it to be used as a map key
 impl Eq for Value {}
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        use std::cmp::Ordering;
+
+        use Value::*;
+
+        match (self, other) {
+            // Null is only equal to Null
+            (Null, Null) => Ordering::Equal,
+            (Null, _) => Ordering::Less,
+            (_, Null) => Ordering::Greater,
+
+            // Bool comparison
+            (Bool(a), Bool(b)) => a.cmp(b),
+            (Bool(_), _) => Ordering::Less,
+            (_, Bool(_)) => Ordering::Greater,
+
+            // Integer comparison
+            (Integer(a), Integer(b)) => a.cmp(b),
+            (Integer(_), _) => Ordering::Less,
+            (_, Integer(_)) => Ordering::Greater,
+
+            // Float comparison - NaN is treated as equal to NaN for ordering purposes
+            (Float(a), Float(b)) => {
+                if a.is_nan() && b.is_nan() {
+                    Ordering::Equal
+                } else if a.is_nan() {
+                    Ordering::Greater // NaN sorts last
+                } else if b.is_nan() {
+                    Ordering::Less
+                } else {
+                    a.partial_cmp(b).unwrap_or(Ordering::Equal)
+                }
+            }
+            (Float(_), _) => Ordering::Less,
+            (_, Float(_)) => Ordering::Greater,
+
+            // Bytes comparison
+            (Bytes(a), Bytes(b)) => a.cmp(b),
+            (Bytes(_), _) => Ordering::Less,
+            (_, Bytes(_)) => Ordering::Greater,
+
+            // Text comparison
+            (Text(a), Text(b)) => a.cmp(b),
+            (Text(_), _) => Ordering::Less,
+            (_, Text(_)) => Ordering::Greater,
+
+            // Array comparison
+            (Array(a), Array(b)) => a.cmp(b),
+            (Array(_), _) => Ordering::Less,
+            (_, Array(_)) => Ordering::Greater,
+
+            // Map comparison
+            (Map(a), Map(b)) => {
+                // Compare maps by converting to sorted vectors and comparing
+                let a_vec: Vec<_> = a.iter().collect();
+                let b_vec: Vec<_> = b.iter().collect();
+                a_vec.cmp(&b_vec)
+            }
+            (Map(_), _) => Ordering::Less,
+            (_, Map(_)) => Ordering::Greater,
+
+            // Tag comparison
+            (Tag(tag_a, val_a), Tag(tag_b, val_b)) => match tag_a.cmp(tag_b) {
+                Ordering::Equal => val_a.cmp(val_b),
+                other => other,
+            },
+        }
+    }
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -337,16 +427,15 @@ where
 struct ValueSerializer;
 
 impl Serializer for ValueSerializer {
-    type Ok = Value;
     type Error = crate::Error;
-
+    type Ok = Value;
+    type SerializeMap = SerializeMap;
     type SerializeSeq = SerializeVec;
+    type SerializeStruct = SerializeMap;
+    type SerializeStructVariant = SerializeStructVariant;
     type SerializeTuple = SerializeVec;
     type SerializeTupleStruct = SerializeVec;
     type SerializeTupleVariant = SerializeTupleVariant;
-    type SerializeMap = SerializeMap;
-    type SerializeStruct = SerializeMap;
-    type SerializeStructVariant = SerializeStructVariant;
 
     fn serialize_bool(self, v: bool) -> Result<Value, crate::Error> {
         Ok(Value::Bool(v))
@@ -522,8 +611,8 @@ struct SerializeVec {
 }
 
 impl serde::ser::SerializeSeq for SerializeVec {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
         self.vec.push(value.serialize(ValueSerializer)?);
@@ -536,8 +625,8 @@ impl serde::ser::SerializeSeq for SerializeVec {
 }
 
 impl serde::ser::SerializeTuple for SerializeVec {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
         serde::ser::SerializeSeq::serialize_element(self, value)
@@ -549,8 +638,8 @@ impl serde::ser::SerializeTuple for SerializeVec {
 }
 
 impl serde::ser::SerializeTupleStruct for SerializeVec {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
         serde::ser::SerializeSeq::serialize_element(self, value)
@@ -567,8 +656,8 @@ struct SerializeTupleVariant {
 }
 
 impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
         self.vec.push(value.serialize(ValueSerializer)?);
@@ -588,8 +677,8 @@ struct SerializeMap {
 }
 
 impl serde::ser::SerializeMap for SerializeMap {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), crate::Error> {
         self.next_key = Some(key.serialize(ValueSerializer)?);
@@ -610,8 +699,8 @@ impl serde::ser::SerializeMap for SerializeMap {
 }
 
 impl serde::ser::SerializeStruct for SerializeMap {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
@@ -632,8 +721,8 @@ struct SerializeStructVariant {
 }
 
 impl serde::ser::SerializeStructVariant for SerializeStructVariant {
-    type Ok = Value;
     type Error = crate::Error;
+    type Ok = Value;
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
@@ -752,5 +841,386 @@ mod tests {
         let bytes = to_vec(&value).unwrap();
         let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(value, decoded);
+    }
+
+    #[test]
+    fn test_value_float() {
+        let value = Value::Float(1.23);
+        assert!(value.is_float());
+        assert_eq!(value.as_f64(), Some(1.23));
+
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(value, decoded);
+    }
+
+    #[test]
+    fn test_value_float_special() {
+        // Test NaN
+        let value = Value::Float(f64::NAN);
+        assert!(value.is_float());
+        assert!(value.as_f64().unwrap().is_nan());
+
+        // Test infinity
+        let value = Value::Float(f64::INFINITY);
+        assert_eq!(value.as_f64(), Some(f64::INFINITY));
+
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded.as_f64(), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_value_from_value() {
+        // Test conversion from Value to typed value
+        let value = Value::Integer(42);
+        let num: i32 = from_value(value).unwrap();
+        assert_eq!(num, 42);
+
+        let value = Value::Text("hello".to_string());
+        let s: String = from_value(value).unwrap();
+        assert_eq!(s, "hello");
+
+        let value = Value::Bool(true);
+        let b: bool = from_value(value).unwrap();
+        assert!(b);
+    }
+
+    #[test]
+    fn test_value_to_value() {
+        // Test conversion from typed value to Value
+        let value = to_value(42i32).unwrap();
+        assert_eq!(value, Value::Integer(42));
+
+        let value = to_value("hello").unwrap();
+        assert_eq!(value, Value::Text("hello".to_string()));
+
+        let value = to_value(true).unwrap();
+        assert_eq!(value, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_value_complex_nested() {
+        let mut inner_map = BTreeMap::new();
+        inner_map.insert(Value::Text("nested".to_string()), Value::Bool(true));
+        inner_map.insert(Value::Text("count".to_string()), Value::Integer(10));
+
+        let value = Value::Array(vec![
+            Value::Map(inner_map),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Null,
+            Value::Float(2.72),
+        ]);
+
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(value, decoded);
+    }
+
+    #[test]
+    fn test_value_nested_arrays() {
+        let value = Value::Array(vec![
+            Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+            Value::Array(vec![Value::Integer(3), Value::Integer(4)]),
+        ]);
+
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(value, decoded);
+    }
+
+    #[test]
+    fn test_value_accessors() {
+        // Test all the is_* and as_* methods
+        let value = Value::Null;
+        assert!(value.is_null());
+        assert!(!value.is_bool());
+        assert!(!value.is_integer());
+
+        let value = Value::Bool(false);
+        assert!(value.is_bool());
+        assert_eq!(value.as_bool(), Some(false));
+
+        let value = Value::Integer(-100);
+        assert!(value.is_integer());
+        assert_eq!(value.as_i64(), Some(-100));
+
+        let value = Value::Float(1.5);
+        assert!(value.is_float());
+        assert_eq!(value.as_f64(), Some(1.5));
+
+        let value = Value::Bytes(vec![0xab, 0xcd]);
+        assert!(value.is_bytes());
+        assert_eq!(value.as_bytes(), Some(&[0xab, 0xcd][..]));
+
+        let value = Value::Text("test".to_string());
+        assert!(value.is_text());
+        assert_eq!(value.as_str(), Some("test"));
+
+        let value = Value::Array(vec![]);
+        assert!(value.is_array());
+        assert_eq!(value.as_array().unwrap().len(), 0);
+
+        let value = Value::Map(BTreeMap::new());
+        assert!(value.is_map());
+        assert_eq!(value.as_map().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_value_ordering() {
+        // Test that Value implements Ord (for use as BTreeMap keys)
+        let mut values = vec![Value::Integer(3), Value::Integer(1), Value::Integer(2)];
+        values.sort();
+        assert_eq!(
+            values,
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+
+        // Test NaN handling in ordering
+        let v1 = Value::Float(1.0);
+        let v2 = Value::Float(f64::NAN);
+        let v3 = Value::Float(2.0);
+        assert!(v1 < v3);
+        // NaN should have consistent ordering
+        assert_eq!(v2.cmp(&v2), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_value_struct_serialization() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct TestStruct {
+            name: String,
+            count: i32,
+            active: bool,
+        }
+
+        let test = TestStruct {
+            name: "test".to_string(),
+            count: 42,
+            active: true,
+        };
+
+        // Convert to Value and back
+        let value = to_value(&test).unwrap();
+        assert!(value.is_map());
+
+        let decoded: TestStruct = from_value(value).unwrap();
+        assert_eq!(decoded, test);
+    }
+
+    #[test]
+    fn test_value_serialize_newtype_struct() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrapper(String);
+
+        let data = Wrapper("wrapped_value".to_string());
+        let value = to_value(&data).unwrap();
+
+        // Newtype structs serialize as their inner value
+        assert_eq!(value, Value::Text("wrapped_value".to_string()));
+
+        let decoded: Wrapper = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_tuple_struct() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Point(i32, i32, i32);
+
+        let data = Point(10, 20, 30);
+        let value = to_value(&data).unwrap();
+
+        // Tuple structs serialize as arrays
+        assert!(value.is_array());
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], Value::Integer(10));
+        assert_eq!(arr[1], Value::Integer(20));
+        assert_eq!(arr[2], Value::Integer(30));
+
+        let decoded: Point = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_newtype_variant() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        enum TestEnum {
+            Value(i32),
+            Text(String),
+        }
+
+        let data = TestEnum::Value(42);
+        let value = to_value(&data).unwrap();
+
+        // Newtype variants serialize as {"variant": value}
+        assert!(value.is_map());
+        let map = value.as_map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&Value::Text("Value".to_string())));
+        assert_eq!(
+            map.get(&Value::Text("Value".to_string())),
+            Some(&Value::Integer(42))
+        );
+
+        let decoded: TestEnum = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_tuple_variant() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        enum TestEnum {
+            Point(i32, i32),
+            Color(u8, u8, u8),
+        }
+
+        let data = TestEnum::Point(100, 200);
+        let value = to_value(&data).unwrap();
+
+        // Tuple variants serialize as {"variant": [values...]}
+        assert!(value.is_map());
+        let map = value.as_map().unwrap();
+        assert_eq!(map.len(), 1);
+
+        let key = Value::Text("Point".to_string());
+        assert!(map.contains_key(&key));
+
+        let inner = map.get(&key).unwrap();
+        assert!(inner.is_array());
+        let arr = inner.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], Value::Integer(100));
+        assert_eq!(arr[1], Value::Integer(200));
+
+        let decoded: TestEnum = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_struct_variant() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        enum TestEnum {
+            Person { name: String, age: u32 },
+            Location { city: String, country: String },
+        }
+
+        let data = TestEnum::Person {
+            name: "Alice".to_string(),
+            age: 30,
+        };
+        let value = to_value(&data).unwrap();
+
+        // Struct variants serialize as {"variant": {"field": value, ...}}
+        assert!(value.is_map());
+        let outer_map = value.as_map().unwrap();
+        assert_eq!(outer_map.len(), 1);
+
+        let key = Value::Text("Person".to_string());
+        assert!(outer_map.contains_key(&key));
+
+        let inner = outer_map.get(&key).unwrap();
+        assert!(inner.is_map());
+        let inner_map = inner.as_map().unwrap();
+        assert_eq!(inner_map.len(), 2);
+        assert_eq!(
+            inner_map.get(&Value::Text("name".to_string())),
+            Some(&Value::Text("Alice".to_string()))
+        );
+        assert_eq!(
+            inner_map.get(&Value::Text("age".to_string())),
+            Some(&Value::Integer(30))
+        );
+
+        let decoded: TestEnum = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_tuple_struct_empty() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Empty();
+
+        let data = Empty();
+        let value = to_value(&data).unwrap();
+
+        // Empty tuple struct serializes as empty array
+        assert!(value.is_array());
+        assert_eq!(value.as_array().unwrap().len(), 0);
+
+        let decoded: Empty = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_tuple_variant_nested() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        enum Outer {
+            Data(Vec<i32>, String),
+        }
+
+        let data = Outer::Data(vec![1, 2, 3], "test".to_string());
+        let value = to_value(&data).unwrap();
+
+        // Verify nested structures work correctly
+        assert!(value.is_map());
+        let map = value.as_map().unwrap();
+        let inner = map.get(&Value::Text("Data".to_string())).unwrap();
+        assert!(inner.is_array());
+        let arr = inner.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // First element is an array
+        assert!(arr[0].is_array());
+        let inner_arr = arr[0].as_array().unwrap();
+        assert_eq!(inner_arr.len(), 3);
+
+        // Second element is a string
+        assert_eq!(arr[1], Value::Text("test".to_string()));
+
+        let decoded: Outer = from_value(value).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_serialize_struct_variant_complex() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        enum ComplexEnum {
+            Config {
+                enabled: bool,
+                settings: Vec<String>,
+                count: u32,
+            },
+        }
+
+        let data = ComplexEnum::Config {
+            enabled: true,
+            settings: vec!["opt1".to_string(), "opt2".to_string()],
+            count: 5,
+        };
+        let value = to_value(&data).unwrap();
+
+        // Verify complex struct variant serialization
+        assert!(value.is_map());
+        let outer_map = value.as_map().unwrap();
+        let inner = outer_map.get(&Value::Text("Config".to_string())).unwrap();
+        assert!(inner.is_map());
+        let inner_map = inner.as_map().unwrap();
+
+        assert_eq!(
+            inner_map.get(&Value::Text("enabled".to_string())),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            inner_map.get(&Value::Text("count".to_string())),
+            Some(&Value::Integer(5))
+        );
+
+        let settings = inner_map.get(&Value::Text("settings".to_string())).unwrap();
+        assert!(settings.is_array());
+
+        let decoded: ComplexEnum = from_value(value).unwrap();
+        assert_eq!(decoded, data);
     }
 }
