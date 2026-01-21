@@ -8,6 +8,8 @@
 .secrets
 .cargo/config.toml
 
+Cargo.lock
+
 .vscode
 
 /semver-checks/target/
