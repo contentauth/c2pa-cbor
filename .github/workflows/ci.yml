@@ -1,13 +1,4 @@
-# Enforce Tier 1A support tier.
-
-# See tier-1b.yml for a more complete suite of tests.
-# You can add the label "check-release" to any PR to invoke that
-# larger set of tests.
-
-# If you change the supported platforms in this workflow, please also
-# update docs/support-tiers.md to match the changes you're making.
-
-name: Tier 1A
+name: CI
 
 on:
   workflow_dispatch:
@@ -31,18 +22,24 @@ jobs:
       github.event.pull_request.author_association == 'COLLABORATOR' ||
       github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
-      contains(github.event.pull_request.labels.*.name, 'safe to test') ||
-      contains(github.event.pull_request.labels.*.name, 'check-release')
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
 
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        rust_version: [stable, 1.88.0]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust_version }}
           components: llvm-tools-preview
 
       - name: Cache Rust dependencies
@@ -52,10 +49,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Generate code coverage
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          cargo llvm-cov --lib --lcov --output-path lcov.info
+        run: cargo llvm-cov --lib --all-features --lcov --output-path lcov.info
 
       - name: Filter out tests
         uses: scouten/uncover-tests@v1
@@ -78,36 +72,6 @@ jobs:
           verbose: true
           files: ./lcov.filtered.info
 
-  docs_rs:
-    name: Preflight docs.rs build
-    runs-on: ubuntu-latest
-
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.author_association == 'COLLABORATOR' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.user.login == 'dependabot[bot]' ||
-      contains(github.event.pull_request.labels.*.name, 'safe to test') ||
-      contains(github.event.pull_request.labels.*.name, 'check-release')
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-docs-rs
-        uses: dtolnay/install@cargo-docs-rs
-
-      - name: Preflight docs.rs
-        env:
-          RUSTDOCFLAGS: -Dwarnings
-        run: cargo docs-rs -p c2pa_cbor
-
   doc-tests:
     name: Doc tests (requires nightly Rust)
     # TODO: Remove this once cargo-llvm-cov can run doc tests and generate
@@ -120,8 +84,7 @@ jobs:
       github.event.pull_request.author_association == 'COLLABORATOR' ||
       github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
-      contains(github.event.pull_request.labels.*.name, 'safe to test') ||
-      contains(github.event.pull_request.labels.*.name, 'check-release')
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
 
     runs-on: ubuntu-latest
 
@@ -166,6 +129,84 @@ jobs:
       #     token: ${{ secrets.CODECOV_TOKEN }}
       #     fail_ci_if_error: true
       #     verbose: true
+
+  tests-cross:
+    name: Unit tests
+
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-gnu]
+        rust_version: [stable, 1.88.0]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust_version }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation toolset
+        run: cargo install cross
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests (cross build)
+        run: cross test --lib --all-features --target ${{ matrix.target }}
+
+  tests-ios:
+    name: Unit tests on iOS simulator
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          targets: aarch64-apple-ios-sim
+
+      - name: Install cargo-dinghy
+        run: |
+          VERSION=0.8.1
+          URL="https://github.com/sonos/dinghy/releases/download/${VERSION}/cargo-dinghy-macos-${VERSION}.tgz"
+          wget -O - $URL | tar -xz --strip-components=1 -C ~/.cargo/bin
+
+      - name: Check cargo-dinghy version.
+        run: cargo dinghy --version
+
+      - name: Setup iOS Simulator
+        # Use the first installed iOS runtime and the first (i.e. oldest) supported iPhone device.
+        run: |
+          RUNTIME=$(xcrun simctl list runtimes --json | jq '.runtimes | map(select(.name | contains("iOS"))) | .[0]')
+          RUNTIME_ID=$(echo $RUNTIME | jq -r '.identifier')
+          echo "Using runtime:" $RUNTIME_ID
+          DEVICE_ID=$(echo $RUNTIME | jq -r '.supportedDeviceTypes | map(select(.productFamily == "iPhone")) | .[0].identifier')
+          echo "Using device:" $DEVICE_ID
+          SIM_ID=$(xcrun simctl create Test-iPhone $DEVICE_ID $RUNTIME_ID)
+          echo "Created simulator:" $SIM_ID
+          xcrun simctl boot $SIM_ID
+          echo "device=$SIM_ID" >> $GITHUB_ENV
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests (cross build)
+        run: cargo dinghy -p auto-ios-aarch64-sim -d ${{ env.device }} test --all-targets --all-features
 
   tests-wasm:
     name: Unit tests (Wasm)
@@ -214,44 +255,6 @@ jobs:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           WASM_BINDGEN_TEST_TIMEOUT: 60
 
-  benchmarks:
-    name: Run benchmarks on signing and reading
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.author_association == 'COLLABORATOR' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.user.login == 'dependabot[bot]' ||
-      contains(github.event.pull_request.labels.*.name, 'safe to test') ||
-      contains(github.event.pull_request.labels.*.name, 'check-release')
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
-      - name: Install cargo-codspeed
-        run: cargo binstall --no-confirm cargo-codspeed
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build the benchmark target(s)
-        run: cargo codspeed build -p c2pa_cbor --all-features
-
-      - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
-        with:
-          mode: instrumentation
-          run: cargo codspeed run
-          token: ${{ secrets.CODSPEED_TOKEN }}
-
   tests-wasi:
     name: Unit tests (WASI)
     if: |
@@ -299,8 +302,41 @@ jobs:
         run: |
           cargo +nightly-2026-01-16 test --target wasm32-wasip2 -p c2pa_cbor --all-features -- --no-capture
 
-  clippy_check:
-    name: Clippy
+  test-direct-minimal-versions:
+    name: Unit tests with minimum versions of direct dependencies
+
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-06
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: |
+          cargo +nightly-2025-12-06 test -Z direct-minimal-versions --all-targets --all-features
+
+  benchmarks:
+    name: Run benchmarks on signing and reading
     if: |
       github.event_name != 'pull_request' ||
       github.event.pull_request.author_association == 'COLLABORATOR' ||
@@ -308,6 +344,44 @@ jobs:
       github.event.pull_request.user.login == 'dependabot[bot]' ||
       contains(github.event.pull_request.labels.*.name, 'safe to test') ||
       contains(github.event.pull_request.labels.*.name, 'check-release')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-codspeed
+        run: cargo binstall --no-confirm cargo-codspeed
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build -p c2pa_cbor --all-features
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: instrumentation
+          run: cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
+
+  clippy_check:
+    name: Clippy
+
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
 
     runs-on: ubuntu-latest
 
@@ -329,13 +403,13 @@ jobs:
 
   cargo_fmt:
     name: Enforce Rust code format
+
     if: |
       github.event_name != 'pull_request' ||
       github.event.pull_request.author_association == 'COLLABORATOR' ||
       github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
-      contains(github.event.pull_request.labels.*.name, 'safe to test') ||
-      contains(github.event.pull_request.labels.*.name, 'check-release')
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
 
     runs-on: ubuntu-latest
 
@@ -352,15 +426,47 @@ jobs:
       - name: Check format
         run: cargo +nightly-2026-01-16 fmt --all -- --check
 
-  cargo-deny:
-    name: License / vulnerability audit
+  docs_rs:
+    name: Preflight docs.rs build
+    runs-on: ubuntu-latest
+
     if: |
       github.event_name != 'pull_request' ||
       github.event.pull_request.author_association == 'COLLABORATOR' ||
       github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
-      contains(github.event.pull_request.labels.*.name, 'safe to test') ||
-      contains(github.event.pull_request.labels.*.name, 'check-release')
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        # Nightly is used here because the docs.rs build
+        # uses nightly and we use doc_cfg features that are
+        # not in stable Rust as of this writing (Rust 1.88).
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-docs-rs
+        uses: dtolnay/install@cargo-docs-rs
+
+      - name: Preflight docs.rs
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo docs-rs -p c2pa_cbor
+
+  cargo-deny:
+    name: License / vulnerability audit
+
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
 
     runs-on: ubuntu-latest
 
@@ -368,7 +474,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Audit crate dependencies
-        uses: EmbarkStudios/cargo-deny-action@v2
+  unused_deps:
+    name: Check for unused dependencies
+
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.user.login == 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'safe to test')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
-          command: check advisories bans licenses sources
+          toolchain: nightly-2025-12-06
+          # Pinning to specific nightly build for now. More recent versions
+          # introduce a lifetime check that creates a whole slew of build
+          # errors.
+
+      - name: Run cargo-udeps
+        run: |
+          mv ./.github/temp-bin/cargo-udeps /home/runner/.cargo/bin/cargo-udeps
+          cargo udeps --all-targets --all-features
+          # NOTE: Using pre-built binary as a workaround for
+          # https://github.com/aig787/cargo-udeps-action/issues/6.
