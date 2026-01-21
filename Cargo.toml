@@ -9,7 +9,6 @@ homepage = "https://contentauthenticity.org"
 repository = "https://github.com/contentauth/c2pa-cbor"
 keywords = ["cbor", "metadata"]
 
-
 [dependencies]
 half = "2.0.0" # for f16 support - until f16 is stabilized
 serde = { version = "1.0", features = ["derive"] }
@@ -23,4 +22,3 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "cbor_perf"
 harness = false
-
