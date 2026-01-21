@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use codspeed_criterion_compat::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
