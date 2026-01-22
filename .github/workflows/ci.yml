@@ -366,6 +366,23 @@ jobs:
           run: cargo codspeed run
           token: ${{ secrets.CODSPEED_TOKEN }}
 
+  publish-preflight:
+    name: Preflight crate publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Dry-run of crate publish
+        run: cargo publish -p c2pa_cbor --dry-run
+
   clippy_check:
     name: Clippy
 
