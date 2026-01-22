@@ -17,6 +17,7 @@ on:
 jobs:
   tests:
     name: Unit tests
+
     if: |
       github.event_name != 'pull_request' ||
       github.event.pull_request.author_association == 'COLLABORATOR' ||
@@ -131,7 +132,7 @@ jobs:
       #     verbose: true
 
   tests-cross:
-    name: Unit tests
+    name: Unit tests (cross)
 
     if: |
       github.event_name != 'pull_request' ||
@@ -172,7 +173,7 @@ jobs:
         run: cross test --lib --all-features --target ${{ matrix.target }}
 
   tests-ios:
-    name: Unit tests on iOS simulator
+    name: Unit tests (iOS simulator)
 
     if: |
       github.event_name != 'pull_request' ||
@@ -464,7 +465,6 @@ jobs:
     name: Enforce TOML format
     if: |
       github.event_name != 'pull_request' ||
-      github.event.pull_request.author_association == 'OWNER' ||
       github.event.pull_request.author_association == 'COLLABORATOR' ||
       github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.user.login == 'dependabot[bot]' ||
