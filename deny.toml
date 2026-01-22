@@ -5,17 +5,16 @@
 
 [graph]
 targets = [
-    { triple = "x86_64-unknown-linux-gnu" },
-    { triple = "x86_64-apple-darwin" },
-    { triple = "x86_64-pc-windows-msvc" },
-    { triple = "aarch64-apple-darwin" },
-    { triple = "wasm32-unknown-unknown" },
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-apple-darwin" },
+  { triple = "wasm32-unknown-unknown" },
 ]
 
 [advisories]
+ignore = []
 yanked = "deny"
-ignore = [
-]
 
 [bans]
 multiple-versions = "allow" # "deny" # TODO: Re-enable when possible.
@@ -38,7 +37,7 @@ allow = [
 confidence-threshold = 0.9
 
 [sources]
-unknown-registry = "deny"
-unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+unknown-git = "deny"
+unknown-registry = "deny"

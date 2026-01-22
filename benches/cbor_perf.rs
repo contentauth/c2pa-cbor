@@ -1,4 +1,4 @@
-// Copyright 2025 Adobe. All rights reserved.
+// Copyright 2026 Adobe. All rights reserved.
 // This file is licensed to you under the Apache License,
 // Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
 // or the MIT license (http://opensource.org/licenses/MIT),
@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use codspeed_criterion_compat::{
+    BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 

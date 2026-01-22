@@ -1,26 +1,26 @@
 [package]
-name = "c2pa_cbor"
-version = "0.2.0"
-edition = "2024"
-description = "CBOR encoder/decoder: serde_cbor compatible with support for tagged types."
 authors = ["Gavin Peacock <gpeacock@adobe.com>"]
-license = "MIT OR Apache-2.0"
+description = "CBOR encoder/decoder: serde_cbor compatible with support for tagged types."
+edition = "2024"
 homepage = "https://contentauthenticity.org"
-repository = "https://github.com/contentauth/c2pa-cbor"
 keywords = ["cbor", "metadata"]
-
+license = "MIT OR Apache-2.0"
+name = "c2pa_cbor"
+repository = "https://github.com/contentauth/c2pa-cbor"
+version = "0.2.0"
 
 [dependencies]
-half = "2.0.0" # for f16 support - until f16 is stabilized
-serde = { version = "1.0", features = ["derive"] }
+half = "2.0.0"                                         # for f16 support - until f16 is stabilized
+serde = { version = "1.0.217", features = ["derive"] }
 serde_bytes = "0.11"
 
 [dev-dependencies]
-serde_json = "1.0"
 serde-transcode = "1.1"
-criterion = { version = "0.5", features = ["html_reports"] }
+serde_json = "1.0.138"
+
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "wasi")))'.dev-dependencies]
+codspeed-criterion-compat = "4.3.0"
 
 [[bench]]
-name = "cbor_perf"
 harness = false
-
+name = "cbor_perf"
