@@ -599,68 +599,9 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         _name: &'static str,
         visitor: V,
     ) -> Result<V::Value> {
-        // For backward compatibility, we need to handle both:
-        // 1. NEW format: [inner_value] - 1-element array (proper tuple struct encoding)
-        // 2. OLD format: inner_value - direct value (legacy transparent behavior)
-        //
-        // Strategy: Peek at the next byte to determine the format
-        let initial = self.read_u8()?;
-        let major = initial >> 5;
-        let info = initial & 0x1f;
-
-        if major == MAJOR_ARRAY {
-            // NEW format: array wrapping - deserialize as sequence
-            match self.read_length(info)? {
-                Some(1) => {
-                    // 1-element array - extract the single element
-                    visitor.visit_newtype_struct(&mut *self)
-                }
-                Some(len) => {
-                    // Wrong array length for newtype struct
-                    Err(Error::Syntax(format!(
-                        "Expected 1-element array for newtype struct, got {} elements",
-                        len
-                    )))
-                }
-                None => {
-                    // Indefinite-length array not supported for newtype struct
-                    Err(Error::Syntax(
-                        "Indefinite-length array not supported for newtype struct".to_string(),
-                    ))
-                }
-            }
-        } else {
-            // OLD format: direct value (backward compatibility)
-            // Put the byte back and deserialize the inner value directly
-            // We need to reconstruct the deserializer state with the byte we already read
-            match major {
-                MAJOR_MAP => match self.read_length(info)? {
-                    Some(len) => visitor.visit_newtype_struct(MapDeserializer {
-                        de: self,
-                        remaining: Some(u64_to_usize(len)?),
-                    }),
-                    None => visitor.visit_newtype_struct(MapDeserializer {
-                        de: self,
-                        remaining: None,
-                    }),
-                },
-                MAJOR_TEXT => {
-                    let len = self.read_length(info)?.ok_or_else(|| {
-                        Error::Syntax("Text in newtype must be definite length".to_string())
-                    })?;
-                    let s = self.read_text(u64_to_usize(len)?)?;
-                    visitor.visit_newtype_struct(StringDeserializer { value: s })
-                }
-                _ => {
-                    // For other types, use prefetched deserializer
-                    visitor.visit_newtype_struct(PrefetchedDeserializer {
-                        de: self,
-                        major,
-                        info,
-                    })
-                }
-            }
-        }
+        // Newtype structs are serialized transparently (just the inner value)
+        // This is serde's standard behavior - the newtype wrapper is not encoded in CBOR
+        visitor.visit_newtype_struct(self)
     }
 }
 
@@ -759,25 +700,6 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
             },
             _ => Err(Error::Syntax("Unsupported type in option".to_string())),
         }
-    }
-}
-
-// String deserializer for backward compatibility in newtype structs
-struct StringDeserializer {
-    value: String,
-}
-
-impl<'de> serde::Deserializer<'de> for StringDeserializer {
-    type Error = crate::Error;
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct map struct enum identifier ignored_any
-    }
-
-    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        visitor.visit_string(self.value)
     }
 }
 
