@@ -7,7 +7,7 @@ keywords = ["cbor", "metadata"]
 license = "MIT OR Apache-2.0"
 name = "c2pa_cbor"
 repository = "https://github.com/contentauth/c2pa-cbor"
-version = "0.77.0"
+version = "0.77.1"
 
 [dependencies]
 half = "2.0.0"                                         # for f16 support - until f16 is stabilized
