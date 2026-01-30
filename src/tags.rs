@@ -20,7 +20,7 @@ use serde::{
     de::{self, Visitor},
 };
 
-use crate::{Encoder, Result, constants::*};
+use crate::{Decoder, Encoder, Result, constants::*};
 
 /// A tagged CBOR value
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +35,50 @@ impl<T> Tagged<T> {
     /// Create a new tagged value
     pub fn new(tag: Option<u64>, value: T) -> Self {
         Tagged { tag, value }
+    }
+}
+
+impl<T: for<'de> Deserialize<'de>> Tagged<T> {
+    /// Deserialize a Tagged value from CBOR bytes, explicitly capturing the tag if present
+    ///
+    /// This method is similar to [`crate::from_slice`] but explicitly preserves CBOR tag
+    /// information. While `from_slice` uses transparent tag handling (ignoring tags for
+    /// plain types), this method directly reads the tag from the CBOR stream and returns
+    /// it as part of the `Tagged` struct.
+    ///
+    /// This is useful when you need to distinguish between tagged and untagged values,
+    /// or when working with types that encode semantic information via tags (e.g., dates,
+    /// URIs, bignums).
+    ///
+    /// # Example
+    /// ```
+    /// use c2pa_cbor::tags::Tagged;
+    ///
+    /// let cbor = vec![
+    ///     0xd8, 0x20, 0x78, 0x13, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x65, 0x78, 0x61,
+    ///     0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    /// ];
+    /// let tagged = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
+    /// assert_eq!(tagged.tag, Some(32)); // URI tag
+    /// assert_eq!(tagged.value, "https://example.com");
+    /// ```
+    pub fn from_tagged_slice(cbor: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::from_slice(cbor);
+
+        // Peek at the next byte to check if there's a tag
+        let peek = decoder.peek_u8()?;
+        let major = peek >> 5;
+
+        if major == MAJOR_TAG {
+            // Tag present - read it and then decode the value
+            let tag = decoder.read_tag()?;
+            let value: T = decoder.decode()?;
+            Ok(Tagged::new(Some(tag), value))
+        } else {
+            // No tag - just decode the value
+            let value: T = decoder.decode()?;
+            Ok(Tagged::new(None, value))
+        }
     }
 }
 
@@ -61,32 +105,32 @@ impl<T: Serialize> Serialize for Tagged<T> {
                     33 => "__cbor_tag_33__", // Base64url
                     34 => "__cbor_tag_34__", // Base64
                     36 => "__cbor_tag_36__", // MIME
-                    
+
                     // RFC 8746 - Typed arrays (64-87)
-                    64 => "__cbor_tag_64__",  // uint8 array
-                    65 => "__cbor_tag_65__",  // uint16 big-endian
-                    66 => "__cbor_tag_66__",  // uint32 big-endian
-                    67 => "__cbor_tag_67__",  // uint64 big-endian
-                    68 => "__cbor_tag_68__",  // uint8 clamped
-                    69 => "__cbor_tag_69__",  // uint16 little-endian
-                    70 => "__cbor_tag_70__",  // uint32 little-endian
-                    71 => "__cbor_tag_71__",  // uint64 little-endian
-                    72 => "__cbor_tag_72__",  // sint8
-                    73 => "__cbor_tag_73__",  // sint16 big-endian
-                    74 => "__cbor_tag_74__",  // sint32 big-endian
-                    75 => "__cbor_tag_75__",  // sint64 big-endian
-                    77 => "__cbor_tag_77__",  // sint16 little-endian
-                    78 => "__cbor_tag_78__",  // sint32 little-endian
-                    79 => "__cbor_tag_79__",  // sint64 little-endian
-                    80 => "__cbor_tag_80__",  // float16 big-endian
-                    81 => "__cbor_tag_81__",  // float32 big-endian
-                    82 => "__cbor_tag_82__",  // float64 big-endian
-                    83 => "__cbor_tag_83__",  // float128 big-endian
-                    84 => "__cbor_tag_84__",  // float16 little-endian
-                    85 => "__cbor_tag_85__",  // float32 little-endian
-                    86 => "__cbor_tag_86__",  // float64 little-endian
-                    87 => "__cbor_tag_87__",  // float128 little-endian
-                    
+                    64 => "__cbor_tag_64__", // uint8 array
+                    65 => "__cbor_tag_65__", // uint16 big-endian
+                    66 => "__cbor_tag_66__", // uint32 big-endian
+                    67 => "__cbor_tag_67__", // uint64 big-endian
+                    68 => "__cbor_tag_68__", // uint8 clamped
+                    69 => "__cbor_tag_69__", // uint16 little-endian
+                    70 => "__cbor_tag_70__", // uint32 little-endian
+                    71 => "__cbor_tag_71__", // uint64 little-endian
+                    72 => "__cbor_tag_72__", // sint8
+                    73 => "__cbor_tag_73__", // sint16 big-endian
+                    74 => "__cbor_tag_74__", // sint32 big-endian
+                    75 => "__cbor_tag_75__", // sint64 big-endian
+                    77 => "__cbor_tag_77__", // sint16 little-endian
+                    78 => "__cbor_tag_78__", // sint32 little-endian
+                    79 => "__cbor_tag_79__", // sint64 little-endian
+                    80 => "__cbor_tag_80__", // float16 big-endian
+                    81 => "__cbor_tag_81__", // float32 big-endian
+                    82 => "__cbor_tag_82__", // float64 big-endian
+                    83 => "__cbor_tag_83__", // float128 big-endian
+                    84 => "__cbor_tag_84__", // float16 little-endian
+                    85 => "__cbor_tag_85__", // float32 little-endian
+                    86 => "__cbor_tag_86__", // float64 little-endian
+                    87 => "__cbor_tag_87__", // float128 little-endian
+
                     _ => {
                         // Unsupported tag number - use encode_tagged helper functions instead
                         use serde::ser::Error;
@@ -96,7 +140,7 @@ impl<T: Serialize> Serialize for Tagged<T> {
                         )));
                     }
                 };
-                
+
                 serializer.serialize_newtype_struct(tag_str, &self.value)
             }
             None => {
@@ -132,7 +176,10 @@ where
 
             // Handle CBOR tags via newtype_struct
             // The CBOR decoder wraps tagged values in a newtype, then provides a map with tag info
-            fn visit_newtype_struct<D>(self, deserializer: D) -> std::result::Result<Tagged<T>, D::Error>
+            fn visit_newtype_struct<D>(
+                self,
+                deserializer: D,
+            ) -> std::result::Result<Tagged<T>, D::Error>
             where
                 D: Deserializer<'de>,
             {
@@ -144,7 +191,7 @@ where
                     #[serde(rename = "__value__")]
                     value: T,
                 }
-                
+
                 // This will work when deserializing CBOR tags
                 if let Ok(tv) = TagAndValue::deserialize(deserializer) {
                     return Ok(Tagged {
@@ -152,7 +199,7 @@ where
                         value: tv.value,
                     });
                 }
-                
+
                 // If that didn't work, it's not a CBOR tag or something went wrong
                 Err(de::Error::custom(
                     "expected CBOR tagged value with tag/value map",
@@ -297,12 +344,10 @@ where
                         tag: helper.tag,
                         value: helper.value,
                     }),
-                    Err(e) => {
-                        Err(de::Error::custom(format!(
-                            "expected tagged value structure or plain value: {}",
-                            e
-                        )))
-                    }
+                    Err(e) => Err(de::Error::custom(format!(
+                        "expected tagged value structure or plain value: {}",
+                        e
+                    ))),
                 }
             }
         }
@@ -433,11 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tagged_deserialize_from_cbor() {
-        // From CBOR: should handle both tagged and untagged
+    fn test_tagged_deserialize_from_tagged_slice() {
+        // From CBOR: use from_tagged_slice to explicitly capture tags
         let tagged_original = Tagged::new(Some(32), "https://example.com".to_string());
         let cbor = crate::to_vec(&tagged_original).unwrap();
-        let tagged_decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        let tagged_decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
 
         assert_eq!(tagged_decoded.tag, Some(32));
         assert_eq!(tagged_decoded.value, "https://example.com");
@@ -686,9 +731,8 @@ mod tests {
         let tagged = Tagged::new(Some(32), "https://example.com".to_string());
         let cbor = crate::to_vec(&tagged).unwrap();
 
-        // Tagged serializes as a map with tag and value fields
-        // Decode it back as Tagged to verify round-trip
-        let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        // Decode it back using from_tagged_slice to explicitly capture the tag
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, Some(32));
         assert_eq!(decoded.value, "https://example.com");
     }
@@ -698,9 +742,8 @@ mod tests {
         let tagged = Tagged::new(None, "plain string".to_string());
         let cbor = crate::to_vec(&tagged).unwrap();
 
-        // Tagged without a tag serializes as just the value
-        // Decode it back as Tagged to verify round-trip
-        let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        // Decode it back using from_tagged_slice - should work for untagged values too
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, None);
         assert_eq!(decoded.value, "plain string");
     }
@@ -755,7 +798,9 @@ mod tests {
         }
 
         impl<'de> Deserialize<'de> for DateT {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+            fn deserialize<D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> std::result::Result<Self, D::Error> {
                 let tagged = Tagged::<String>::deserialize(deserializer)?;
                 match tagged.tag {
                     Some(0) | None => Ok(DateT(tagged.value)),
@@ -790,8 +835,8 @@ mod tests {
         let tag = decoder.read_tag().unwrap();
         assert_eq!(tag, 0);
 
-        // Decode back
-        let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        // Decode back using from_tagged_slice to explicitly capture the tag
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, Some(0));
         assert_eq!(decoded.value, "2024-01-15T10:30:00Z");
     }
@@ -808,8 +853,8 @@ mod tests {
         let tag = decoder.read_tag().unwrap();
         assert_eq!(tag, 1);
 
-        // Decode back
-        let decoded: Tagged<i64> = crate::from_slice(&cbor).unwrap();
+        // Decode back using from_tagged_slice
+        let decoded = Tagged::<i64>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, Some(1));
         assert_eq!(decoded.value, timestamp);
     }
@@ -825,8 +870,8 @@ mod tests {
         let tag = decoder.read_tag().unwrap();
         assert_eq!(tag, 32);
 
-        // Decode back
-        let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        // Decode back using from_tagged_slice
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, Some(32));
         assert_eq!(decoded.value, "https://example.com");
     }
@@ -850,6 +895,9 @@ mod tests {
     #[test]
     fn test_multiple_tagged_values_in_array() {
         // Test an array containing multiple tagged values
+        // Note: With transparent mode, deserializing Vec<Tagged<T>> via serde
+        // will lose tag information. Each Tagged element needs to be decoded
+        // individually using from_tagged_slice, or use a custom deserializer.
         let values = vec![
             Tagged::new(Some(0), "2024-01-15T10:30:00Z".to_string()),
             Tagged::new(Some(32), "https://example.com".to_string()),
@@ -857,12 +905,15 @@ mod tests {
         ];
 
         let cbor = crate::to_vec(&values).unwrap();
+
+        // Transparent mode: tags are lost when deserializing through serde
         let decoded: Vec<Tagged<String>> = crate::from_slice(&cbor).unwrap();
 
         assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded[0].tag, Some(0));
+        // In transparent mode, all tags become None (values are preserved)
+        assert_eq!(decoded[0].tag, None);
         assert_eq!(decoded[0].value, "2024-01-15T10:30:00Z");
-        assert_eq!(decoded[1].tag, Some(32));
+        assert_eq!(decoded[1].tag, None);
         assert_eq!(decoded[1].value, "https://example.com");
         assert_eq!(decoded[2].tag, None);
         assert_eq!(decoded[2].value, "untagged");

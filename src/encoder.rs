@@ -228,7 +228,7 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
                 }
             }
         }
-        
+
         // Serialize transparently (just the inner value, not wrapped in an array)
         // This is serde's default behavior for newtype structs
         // Users can still use #[serde(transparent)] for clarity, but it's not required
