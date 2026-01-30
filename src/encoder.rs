@@ -214,10 +214,21 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
         self.serialize_str(variant)
     }
 
-    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<()>
+    fn serialize_newtype_struct<T>(self, name: &'static str, value: &T) -> Result<()>
     where
         T: ?Sized + Serialize,
     {
+        // Check if this is a special CBOR tag marker from Tagged<T>
+        if let Some(tag_str) = name.strip_prefix("__cbor_tag_") {
+            if let Some(tag_num_str) = tag_str.strip_suffix("__") {
+                if let Ok(tag) = tag_num_str.parse::<u64>() {
+                    // Write the CBOR tag and then serialize the value
+                    self.write_tag(tag)?;
+                    return value.serialize(self);
+                }
+            }
+        }
+        
         // Serialize transparently (just the inner value, not wrapped in an array)
         // This is serde's default behavior for newtype structs
         // Users can still use #[serde(transparent)] for clarity, but it's not required
