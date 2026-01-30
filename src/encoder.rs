@@ -218,10 +218,9 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     where
         T: ?Sized + Serialize,
     {
-        // Serialize as a 1-element array to maintain tuple struct semantics
-        // This allows tuple structs like `struct Wrapper(Inner)` to round-trip correctly
-        // Users can override with #[serde(transparent)] if they want the inner value directly
-        self.write_type_value(MAJOR_ARRAY, 1)?;
+        // Serialize transparently (just the inner value, not wrapped in an array)
+        // This is serde's default behavior for newtype structs
+        // Users can still use #[serde(transparent)] for clarity, but it's not required
         value.serialize(self)
     }
 
