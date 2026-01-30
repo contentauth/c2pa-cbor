@@ -5,10 +5,10 @@
 // at your option.
 
 // Test for newtype struct handling - verifies fix for transparent serialization
-// 
+//
 // Bug: Given a definition like:
 //   pub struct TimeStamp(pub HashMap<String, ByteBuf>);
-// 
+//
 // The serde default should be transparent and timestamp should serialize as a map.
 // But without fixes, it was being serialized as an array with a map inside it.
 
@@ -157,10 +157,7 @@ fn test_explicitly_transparent_newtype() {
     let first_byte = cbor_bytes[0];
     let major_type = first_byte >> 5;
 
-    assert_eq!(
-        major_type, 5,
-        "Transparent newtype should serialize as map"
-    );
+    assert_eq!(major_type, 5, "Transparent newtype should serialize as map");
 
     let deserialized: TransparentMap = c2pa_cbor::from_slice(&cbor_bytes).expect("deserialize");
     assert_eq!(transparent, deserialized);
