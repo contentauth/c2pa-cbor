@@ -2611,4 +2611,88 @@ mod tests {
                 || err_str.contains("platform")
         );
     }
+
+    #[test]
+    fn test_option_with_tagged_values() {
+        use crate::tags::Tagged;
+        
+        // Test Option<Tagged<String>> with tag using from_tagged_slice
+        let tagged = Tagged::new(Some(0), "2024-01-15T10:30:00Z".to_string());
+        let cbor = to_vec(&tagged).unwrap();
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
+        assert_eq!(decoded.tag, Some(0));
+        assert_eq!(decoded.value, "2024-01-15T10:30:00Z");
+        
+        // Test that transparent mode works in Options (tag is ignored)
+        let some_tagged = Some(Tagged::new(Some(32), "https://example.com".to_string()));
+        let cbor = to_vec(&some_tagged).unwrap();
+        let decoded: Option<Tagged<String>> = from_slice(&cbor).unwrap();
+        // With transparent mode, tag is lost but value is preserved
+        assert_eq!(decoded.as_ref().map(|t| &t.value), Some(&"https://example.com".to_string()));
+        
+        // Test Option with None
+        let none: Option<Tagged<String>> = None;
+        let cbor = to_vec(&none).unwrap();
+        let decoded: Option<Tagged<String>> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn test_option_with_arrays() {
+        // Test Option<Vec<i32>>
+        let some_vec = Some(vec![1, 2, 3]);
+        let cbor = to_vec(&some_vec).unwrap();
+        let decoded: Option<Vec<i32>> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, some_vec);
+        
+        // Test None
+        let none: Option<Vec<i32>> = None;
+        let cbor = to_vec(&none).unwrap();
+        let decoded: Option<Vec<i32>> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn test_option_with_maps() {
+        use std::collections::HashMap;
+        
+        // Test Option<HashMap<String, i32>>
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), 1);
+        map.insert("b".to_string(), 2);
+        let some_map = Some(map.clone());
+        let cbor = to_vec(&some_map).unwrap();
+        let decoded: Option<HashMap<String, i32>> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, some_map);
+        
+        // Test None
+        let none: Option<HashMap<String, i32>> = None;
+        let cbor = to_vec(&none).unwrap();
+        let decoded: Option<HashMap<String, i32>> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn test_option_with_struct() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Person {
+            name: String,
+            age: u32,
+        }
+        
+        // Test Option<struct>
+        let person = Some(Person {
+            name: "Alice".to_string(),
+            age: 30,
+        });
+        let cbor = to_vec(&person).unwrap();
+        let decoded: Option<Person> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, person);
+        
+        // Test None
+        let none: Option<Person> = None;
+        let cbor = to_vec(&none).unwrap();
+        let decoded: Option<Person> = from_slice(&cbor).unwrap();
+        assert_eq!(decoded, None);
+    }
 }

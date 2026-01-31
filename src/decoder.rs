@@ -752,6 +752,54 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 let buf = self.de.read_bytes(u64_to_usize(len)?)?;
                 visitor.visit_byte_buf(buf)
             }
+            MAJOR_ARRAY => {
+                self.de.check_recursion_depth()?;
+                self.de.recursion_depth += 1;
+                match self.de.read_length(self.info)? {
+                    Some(len) => visitor.visit_seq(SeqAccess {
+                        de: self.de,
+                        remaining: Some(u64_to_usize(len)?),
+                    }),
+                    None => visitor.visit_seq(SeqAccess {
+                        de: self.de,
+                        remaining: None,
+                    }),
+                }
+                // Note: recursion_depth is decremented in SeqAccess::drop
+            }
+            MAJOR_MAP => {
+                self.de.check_recursion_depth()?;
+                self.de.recursion_depth += 1;
+                match self.de.read_length(self.info)? {
+                    Some(len) => visitor.visit_map(MapAccess {
+                        de: self.de,
+                        remaining: Some(u64_to_usize(len)?),
+                    }),
+                    None => visitor.visit_map(MapAccess {
+                        de: self.de,
+                        remaining: None,
+                    }),
+                }
+                // Note: recursion_depth is decremented in MapAccess::drop
+            }
+            MAJOR_TAG => {
+                // Read the tag number
+                let tag = self.de.read_length(self.info)?.ok_or_else(|| {
+                    Error::Syntax("Tag cannot be indefinite".to_string())
+                })?;
+                // Store the tag
+                self.de.current_tag = Some(tag);
+
+                // Deserialize the tagged content using TaggedValueDeserializer
+                let result = serde::Deserializer::deserialize_any(
+                    TaggedValueDeserializer { de: self.de, tag },
+                    visitor,
+                );
+
+                // Clear the tag after deserialization
+                self.de.current_tag = None;
+                result
+            }
             MAJOR_SIMPLE => match self.info {
                 FALSE => visitor.visit_bool(false),
                 TRUE => visitor.visit_bool(true),
