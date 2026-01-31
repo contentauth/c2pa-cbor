@@ -1019,14 +1019,36 @@ mod tests {
         let decoded: f32 = from_slice(&encoded).unwrap();
         assert_eq!(f32_val, decoded);
 
-        // Test f64
-        let f64_val = 2.5f64;
+        // Test f64 - behavior depends on compact_floats feature
+        let f64_val = 1.0e+300f64;
         let encoded = to_vec(&f64_val).unwrap();
         println!("f64 encoded: {:?}", encoded);
         // Should be: major type 7 (0xE0), additional info 27 (0x1B), then 8 bytes
         assert_eq!(encoded[0], (MAJOR_SIMPLE << 5) | 27);
         let decoded: f64 = from_slice(&encoded).unwrap();
         assert_eq!(f64_val, decoded);
+
+        #[cfg(feature = "compact_floats")]
+        {
+            // With compact_floats enabled, simple values optimize to f16
+            let simple_val = 2.5f64;
+            let encoded_simple = to_vec(&simple_val).unwrap();
+            // Should optimize to f16 (FLOAT16 = 25)
+            assert_eq!(encoded_simple[0], (MAJOR_SIMPLE << 5) | 25);
+            let decoded_simple: f64 = from_slice(&encoded_simple).unwrap();
+            assert_eq!(simple_val, decoded_simple);
+        }
+
+        #[cfg(not(feature = "compact_floats"))]
+        {
+            // Without compact_floats, all f64 values use full precision
+            let simple_val = 2.5f64;
+            let encoded_simple = to_vec(&simple_val).unwrap();
+            // Should use f64 (FLOAT64 = 27)
+            assert_eq!(encoded_simple[0], (MAJOR_SIMPLE << 5) | 27);
+            let decoded_simple: f64 = from_slice(&encoded_simple).unwrap();
+            assert_eq!(simple_val, decoded_simple);
+        }
 
         // Test in a struct
         #[derive(Debug, Serialize, Deserialize, PartialEq)]

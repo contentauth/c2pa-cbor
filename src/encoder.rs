@@ -166,7 +166,31 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_f64(self, v: f64) -> Result<()> {
-        // Encode as CBOR float64 (major type 7, additional info 27)
+        #[cfg(feature = "compact_floats")]
+        {
+            // Try to encode compactly as f16 first, then f32, fallback to f64
+            // This matches RFC 8949 preferred encoding but may not be compatible with all decoders
+
+            // Try f16 (half precision)
+            let f16_val = half::f16::from_f64(v);
+            if f16_val.to_f64() == v {
+                // Can represent losslessly as f16
+                self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT16])?;
+                self.writer.write_all(&f16_val.to_be_bytes())?;
+                return Ok(());
+            }
+
+            // Try f32 (single precision)
+            let f32_val = v as f32;
+            if (f32_val as f64) == v {
+                // Can represent losslessly as f32
+                self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT32])?;
+                self.writer.write_all(&f32_val.to_be_bytes())?;
+                return Ok(());
+            }
+        }
+
+        // Default: Use full f64 (double precision) for maximum compatibility
         self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT64])?;
         self.writer.write_all(&v.to_be_bytes())?;
         Ok(())

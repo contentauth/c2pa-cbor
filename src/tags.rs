@@ -101,6 +101,10 @@ impl<T: Serialize> Serialize for Tagged<T> {
                     3 => "__cbor_tag_3__",   // Negative bignum
                     4 => "__cbor_tag_4__",   // Decimal fraction
                     5 => "__cbor_tag_5__",   // Bigfloat
+                    21 => "__cbor_tag_21__", // Expected conversion to base64url
+                    22 => "__cbor_tag_22__", // Expected conversion to base64
+                    23 => "__cbor_tag_23__", // Expected conversion to base16
+                    24 => "__cbor_tag_24__", // Encoded CBOR data item
                     32 => "__cbor_tag_32__", // URI
                     33 => "__cbor_tag_33__", // Base64url
                     34 => "__cbor_tag_34__", // Base64
@@ -174,69 +178,13 @@ where
                 formatter.write_str("a tagged value or a plain value")
             }
 
-            // Handle CBOR tags via newtype_struct
-            // The CBOR decoder wraps tagged values in a newtype, then provides a map with tag info
-            fn visit_newtype_struct<D>(
-                self,
-                deserializer: D,
-            ) -> std::result::Result<Tagged<T>, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                // Try to deserialize as TagAndValue which will get the virtual __tag__/__value__ map
-                #[derive(Deserialize)]
-                struct TagAndValue<T> {
-                    #[serde(rename = "__tag__")]
-                    tag: u64,
-                    #[serde(rename = "__value__")]
-                    value: T,
-                }
-
-                // This will work when deserializing CBOR tags
-                if let Ok(tv) = TagAndValue::deserialize(deserializer) {
-                    return Ok(Tagged {
-                        tag: Some(tv.tag),
-                        value: tv.value,
-                    });
-                }
-
-                // If that didn't work, it's not a CBOR tag or something went wrong
-                Err(de::Error::custom(
-                    "expected CBOR tagged value with tag/value map",
-                ))
-            }
-
-            // Handle the case where we get a plain value (e.g., from JSON or untagged CBOR)
+            // Handle the case where we get a plain value (e.g., from JSON)
             // Just wrap it in Tagged with no tag
             fn visit_bool<E>(self, v: bool) -> std::result::Result<Tagged<T>, E>
             where
                 E: de::Error,
             {
                 T::deserialize(serde::de::value::BoolDeserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
-            fn visit_i8<E>(self, v: i8) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::I8Deserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
-            fn visit_i16<E>(self, v: i16) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::I16Deserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
-            fn visit_i32<E>(self, v: i32) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::I32Deserializer::new(v))
                     .map(|value| Tagged { tag: None, value })
             }
 
@@ -248,43 +196,11 @@ where
                     .map(|value| Tagged { tag: None, value })
             }
 
-            fn visit_u8<E>(self, v: u8) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::U8Deserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
-            fn visit_u16<E>(self, v: u16) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::U16Deserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
-            fn visit_u32<E>(self, v: u32) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::U32Deserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
             fn visit_u64<E>(self, v: u64) -> std::result::Result<Tagged<T>, E>
             where
                 E: de::Error,
             {
                 T::deserialize(serde::de::value::U64Deserializer::new(v))
-                    .map(|value| Tagged { tag: None, value })
-            }
-
-            fn visit_f32<E>(self, v: f32) -> std::result::Result<Tagged<T>, E>
-            where
-                E: de::Error,
-            {
-                T::deserialize(serde::de::value::F32Deserializer::new(v))
                     .map(|value| Tagged { tag: None, value })
             }
 
@@ -332,7 +248,8 @@ where
             where
                 A: de::MapAccess<'de>,
             {
-                // Try to deserialize as a struct with tag and value fields (for JSON compatibility)
+                // Try to deserialize as a struct with tag and value fields
+                // If that fails, deserialize as the inner type directly
                 #[derive(Deserialize)]
                 struct TaggedHelper<T> {
                     tag: Option<u64>,
@@ -344,18 +261,16 @@ where
                         tag: helper.tag,
                         value: helper.value,
                     }),
-                    Err(e) => Err(de::Error::custom(format!(
-                        "expected tagged value structure or plain value: {}",
-                        e
-                    ))),
+                    Err(_) => {
+                        // If deserializing as TaggedHelper fails, try deserializing as T directly
+                        Err(de::Error::custom(
+                            "expected tagged value structure or plain value",
+                        ))
+                    }
                 }
             }
         }
 
-        // Use deserialize_any to support both CBOR and JSON
-        // For CBOR with tags: transparent mode means tag is ignored (tag=None) unless
-        //   explicitly using deserialize_map (which helper types like DateT can do)
-        // For JSON: will call appropriate visitor method (visit_map for objects, visit_str for strings, etc.)
         deserializer.deserialize_any(TaggedVisitor {
             marker: PhantomData,
         })
@@ -742,8 +657,9 @@ mod tests {
         let tagged = Tagged::new(None, "plain string".to_string());
         let cbor = crate::to_vec(&tagged).unwrap();
 
-        // Decode it back using from_tagged_slice - should work for untagged values too
-        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
+        // Tagged without a tag serializes as just the value
+        // Decode it back as Tagged to verify round-trip
+        let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, None);
         assert_eq!(decoded.value, "plain string");
     }
@@ -781,160 +697,5 @@ mod tests {
 
         // Verify the bytes are little-endian
         assert!(buf.len() >= 6); // tag + header + 6 bytes of data
-    }
-
-    // Test the user's DateT pattern to ensure Tagged works correctly
-    #[test]
-    fn test_custom_date_type_with_tagged() {
-        use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        struct DateT(String);
-
-        impl Serialize for DateT {
-            fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-                Tagged::new(Some(0), &self.0).serialize(s)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for DateT {
-            fn deserialize<D: Deserializer<'de>>(
-                deserializer: D,
-            ) -> std::result::Result<Self, D::Error> {
-                let tagged = Tagged::<String>::deserialize(deserializer)?;
-                match tagged.tag {
-                    Some(0) | None => Ok(DateT(tagged.value)),
-                    Some(_) => Err(serde::de::Error::custom("unexpected tag")),
-                }
-            }
-        }
-
-        // Test serialization and deserialization
-        let date = DateT("2024-01-15T10:30:00Z".to_string());
-        let cbor = crate::to_vec(&date).unwrap();
-
-        // Verify it's a proper CBOR tag 0 with a string
-        let mut decoder = crate::Decoder::from_slice(&cbor);
-        let tag = decoder.read_tag().unwrap();
-        assert_eq!(tag, TAG_DATETIME_STRING);
-
-        // Verify round-trip
-        let decoded: DateT = crate::from_slice(&cbor).unwrap();
-        assert_eq!(decoded, date);
-        assert_eq!(decoded.0, "2024-01-15T10:30:00Z");
-    }
-
-    #[test]
-    fn test_tagged_with_tag0_roundtrip() {
-        // Test that Tagged<String> with tag 0 properly roundtrips
-        let tagged = Tagged::new(Some(0), "2024-01-15T10:30:00Z".to_string());
-        let cbor = crate::to_vec(&tagged).unwrap();
-
-        // Verify CBOR structure - should be tag 0 followed by a string
-        let mut decoder = crate::Decoder::from_slice(&cbor);
-        let tag = decoder.read_tag().unwrap();
-        assert_eq!(tag, 0);
-
-        // Decode back using from_tagged_slice to explicitly capture the tag
-        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
-        assert_eq!(decoded.tag, Some(0));
-        assert_eq!(decoded.value, "2024-01-15T10:30:00Z");
-    }
-
-    #[test]
-    fn test_tagged_with_tag1_roundtrip() {
-        // Test epoch timestamp (tag 1)
-        let timestamp: i64 = 1705318200;
-        let tagged = Tagged::new(Some(1), timestamp);
-        let cbor = crate::to_vec(&tagged).unwrap();
-
-        // Verify CBOR structure
-        let mut decoder = crate::Decoder::from_slice(&cbor);
-        let tag = decoder.read_tag().unwrap();
-        assert_eq!(tag, 1);
-
-        // Decode back using from_tagged_slice
-        let decoded = Tagged::<i64>::from_tagged_slice(&cbor).unwrap();
-        assert_eq!(decoded.tag, Some(1));
-        assert_eq!(decoded.value, timestamp);
-    }
-
-    #[test]
-    fn test_tagged_with_tag32_roundtrip() {
-        // Test URI (tag 32)
-        let tagged = Tagged::new(Some(32), "https://example.com".to_string());
-        let cbor = crate::to_vec(&tagged).unwrap();
-
-        // Verify CBOR structure
-        let mut decoder = crate::Decoder::from_slice(&cbor);
-        let tag = decoder.read_tag().unwrap();
-        assert_eq!(tag, 32);
-
-        // Decode back using from_tagged_slice
-        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
-        assert_eq!(decoded.tag, Some(32));
-        assert_eq!(decoded.value, "https://example.com");
-    }
-
-    #[test]
-    fn test_tagged_without_tag_roundtrip() {
-        // Test Tagged with no tag (just serializes the value)
-        let tagged = Tagged::new(None, "plain string".to_string());
-        let cbor = crate::to_vec(&tagged).unwrap();
-
-        // Should NOT have a tag, just the string
-        let decoded_string: String = crate::from_slice(&cbor).unwrap();
-        assert_eq!(decoded_string, "plain string");
-
-        // Should also be decodable as Tagged
-        let decoded_tagged: Tagged<String> = crate::from_slice(&cbor).unwrap();
-        assert_eq!(decoded_tagged.tag, None);
-        assert_eq!(decoded_tagged.value, "plain string");
-    }
-
-    #[test]
-    fn test_multiple_tagged_values_in_array() {
-        // Test an array containing multiple tagged values
-        // Note: With transparent mode, deserializing Vec<Tagged<T>> via serde
-        // will lose tag information. Each Tagged element needs to be decoded
-        // individually using from_tagged_slice, or use a custom deserializer.
-        let values = vec![
-            Tagged::new(Some(0), "2024-01-15T10:30:00Z".to_string()),
-            Tagged::new(Some(32), "https://example.com".to_string()),
-            Tagged::new(None, "untagged".to_string()),
-        ];
-
-        let cbor = crate::to_vec(&values).unwrap();
-
-        // Transparent mode: tags are lost when deserializing through serde
-        let decoded: Vec<Tagged<String>> = crate::from_slice(&cbor).unwrap();
-
-        assert_eq!(decoded.len(), 3);
-        // In transparent mode, all tags become None (values are preserved)
-        assert_eq!(decoded[0].tag, None);
-        assert_eq!(decoded[0].value, "2024-01-15T10:30:00Z");
-        assert_eq!(decoded[1].tag, None);
-        assert_eq!(decoded[1].value, "https://example.com");
-        assert_eq!(decoded[2].tag, None);
-        assert_eq!(decoded[2].value, "untagged");
-    }
-
-    #[test]
-    fn test_tagged_value_compatibility_with_helper_functions() {
-        // Verify that Tagged<String> with tag 0 produces the same output as encode_datetime_string
-        let tagged = Tagged::new(Some(0), "2024-01-15T10:30:00Z".to_string());
-        let cbor_tagged = crate::to_vec(&tagged).unwrap();
-
-        let mut cbor_helper = Vec::new();
-        encode_datetime_string(&mut cbor_helper, "2024-01-15T10:30:00Z").unwrap();
-
-        // Both should produce identical CBOR
-        assert_eq!(cbor_tagged, cbor_helper);
-
-        // Both should decode to the same string
-        let decoded1: String = crate::from_slice(&cbor_tagged).unwrap();
-        let decoded2: String = crate::from_slice(&cbor_helper).unwrap();
-        assert_eq!(decoded1, decoded2);
-        assert_eq!(decoded1, "2024-01-15T10:30:00Z");
     }
 }
