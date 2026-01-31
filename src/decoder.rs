@@ -784,9 +784,10 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
             }
             MAJOR_TAG => {
                 // Read the tag number
-                let tag = self.de.read_length(self.info)?.ok_or_else(|| {
-                    Error::Syntax("Tag cannot be indefinite".to_string())
-                })?;
+                let tag = self
+                    .de
+                    .read_length(self.info)?
+                    .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
                 // Store the tag
                 self.de.current_tag = Some(tag);
 
