@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.77.2](https://github.com/contentauth/c2pa-cbor/compare/v0.77.1...v0.77.2)
+_31 January 2026_
+
+### Added
+
+* Ensure tagged types are encoded and decoded as tagged ([#10](https://github.com/contentauth/c2pa-cbor/pull/10))
+
 ## [0.77.1](https://github.com/contentauth/c2pa-cbor/compare/v0.77.0...v0.77.1)
 _30 January 2026_
 
