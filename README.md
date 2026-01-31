@@ -46,6 +46,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"  # For efficient byte array handling
 ```
 
+### Optional Features
+
+- **`compact_floats`**: Enable optimal float encoding (f16/f32/f64 based on precision needed)
+  - By default, all f64 values encode as 8 bytes for maximum compatibility
+  - With this feature, values like `0.0` or `2.5` encode as f16 (2 bytes) when lossless
+  - Matches RFC 8949 preferred encoding but may not work with older CBOR decoders
+  - Enable with: `c2pa_cbor = { version = "0.1", features = ["compact_floats"] }`
+
 ## Quick Start
 
 ### Basic Usage

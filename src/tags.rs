@@ -20,10 +20,10 @@ use serde::{
     de::{self, Visitor},
 };
 
-use crate::{Encoder, Result, constants::*};
+use crate::{Decoder, Encoder, Result, constants::*};
 
 /// A tagged CBOR value
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tagged<T> {
     /// The CBOR tag number (optional for compatibility)
     pub tag: Option<u64>,
@@ -35,6 +35,123 @@ impl<T> Tagged<T> {
     /// Create a new tagged value
     pub fn new(tag: Option<u64>, value: T) -> Self {
         Tagged { tag, value }
+    }
+}
+
+impl<T: for<'de> Deserialize<'de>> Tagged<T> {
+    /// Deserialize a Tagged value from CBOR bytes, explicitly capturing the tag if present
+    ///
+    /// This method is similar to [`crate::from_slice`] but explicitly preserves CBOR tag
+    /// information. While `from_slice` uses transparent tag handling (ignoring tags for
+    /// plain types), this method directly reads the tag from the CBOR stream and returns
+    /// it as part of the `Tagged` struct.
+    ///
+    /// This is useful when you need to distinguish between tagged and untagged values,
+    /// or when working with types that encode semantic information via tags (e.g., dates,
+    /// URIs, bignums).
+    ///
+    /// # Example
+    /// ```
+    /// use c2pa_cbor::tags::Tagged;
+    ///
+    /// let cbor = vec![
+    ///     0xd8, 0x20, 0x78, 0x13, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x65, 0x78, 0x61,
+    ///     0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    /// ];
+    /// let tagged = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
+    /// assert_eq!(tagged.tag, Some(32)); // URI tag
+    /// assert_eq!(tagged.value, "https://example.com");
+    /// ```
+    pub fn from_tagged_slice(cbor: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::from_slice(cbor);
+
+        // Peek at the next byte to check if there's a tag
+        let peek = decoder.peek_u8()?;
+        let major = peek >> 5;
+
+        if major == MAJOR_TAG {
+            // Tag present - read it and then decode the value
+            let tag = decoder.read_tag()?;
+            let value: T = decoder.decode()?;
+            Ok(Tagged::new(Some(tag), value))
+        } else {
+            // No tag - just decode the value
+            let value: T = decoder.decode()?;
+            Ok(Tagged::new(None, value))
+        }
+    }
+}
+
+// Custom serialization that writes proper CBOR tags
+// The encoder parses strings like "__cbor_tag_N__" and writes CBOR tag N
+impl<T: Serialize> Serialize for Tagged<T> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.tag {
+            Some(tag) => {
+                // Map tag numbers to their corresponding marker strings
+                // The encoder's serialize_newtype_struct parses these and writes the actual CBOR tag
+                let tag_str = match tag {
+                    // Standard RFC 8949 tags
+                    0 => "__cbor_tag_0__",   // Date/time string
+                    1 => "__cbor_tag_1__",   // Epoch datetime
+                    2 => "__cbor_tag_2__",   // Positive bignum
+                    3 => "__cbor_tag_3__",   // Negative bignum
+                    4 => "__cbor_tag_4__",   // Decimal fraction
+                    5 => "__cbor_tag_5__",   // Bigfloat
+                    21 => "__cbor_tag_21__", // Expected conversion to base64url
+                    22 => "__cbor_tag_22__", // Expected conversion to base64
+                    23 => "__cbor_tag_23__", // Expected conversion to base16
+                    24 => "__cbor_tag_24__", // Encoded CBOR data item
+                    32 => "__cbor_tag_32__", // URI
+                    33 => "__cbor_tag_33__", // Base64url
+                    34 => "__cbor_tag_34__", // Base64
+                    36 => "__cbor_tag_36__", // MIME
+
+                    // RFC 8746 - Typed arrays (64-87)
+                    64 => "__cbor_tag_64__", // uint8 array
+                    65 => "__cbor_tag_65__", // uint16 big-endian
+                    66 => "__cbor_tag_66__", // uint32 big-endian
+                    67 => "__cbor_tag_67__", // uint64 big-endian
+                    68 => "__cbor_tag_68__", // uint8 clamped
+                    69 => "__cbor_tag_69__", // uint16 little-endian
+                    70 => "__cbor_tag_70__", // uint32 little-endian
+                    71 => "__cbor_tag_71__", // uint64 little-endian
+                    72 => "__cbor_tag_72__", // sint8
+                    73 => "__cbor_tag_73__", // sint16 big-endian
+                    74 => "__cbor_tag_74__", // sint32 big-endian
+                    75 => "__cbor_tag_75__", // sint64 big-endian
+                    77 => "__cbor_tag_77__", // sint16 little-endian
+                    78 => "__cbor_tag_78__", // sint32 little-endian
+                    79 => "__cbor_tag_79__", // sint64 little-endian
+                    80 => "__cbor_tag_80__", // float16 big-endian
+                    81 => "__cbor_tag_81__", // float32 big-endian
+                    82 => "__cbor_tag_82__", // float64 big-endian
+                    83 => "__cbor_tag_83__", // float128 big-endian
+                    84 => "__cbor_tag_84__", // float16 little-endian
+                    85 => "__cbor_tag_85__", // float32 little-endian
+                    86 => "__cbor_tag_86__", // float64 little-endian
+                    87 => "__cbor_tag_87__", // float128 little-endian
+
+                    _ => {
+                        // Unsupported tag number - use encode_tagged helper functions instead
+                        use serde::ser::Error;
+                        return Err(Error::custom(format!(
+                            "Tag {} not supported via Tagged<T>. Use encode_tagged() helper function for arbitrary tags.",
+                            tag
+                        )));
+                    }
+                };
+
+                serializer.serialize_newtype_struct(tag_str, &self.value)
+            }
+            None => {
+                // No tag, just serialize the value directly
+                self.value.serialize(serializer)
+            }
+        }
     }
 }
 
@@ -276,11 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tagged_deserialize_from_cbor() {
-        // From CBOR: should handle both tagged and untagged
+    fn test_tagged_deserialize_from_tagged_slice() {
+        // From CBOR: use from_tagged_slice to explicitly capture tags
         let tagged_original = Tagged::new(Some(32), "https://example.com".to_string());
         let cbor = crate::to_vec(&tagged_original).unwrap();
-        let tagged_decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        let tagged_decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
 
         assert_eq!(tagged_decoded.tag, Some(32));
         assert_eq!(tagged_decoded.value, "https://example.com");
@@ -529,9 +646,8 @@ mod tests {
         let tagged = Tagged::new(Some(32), "https://example.com".to_string());
         let cbor = crate::to_vec(&tagged).unwrap();
 
-        // Tagged serializes as a map with tag and value fields
-        // Decode it back as Tagged to verify round-trip
-        let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
+        // Decode it back using from_tagged_slice to explicitly capture the tag
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, Some(32));
         assert_eq!(decoded.value, "https://example.com");
     }

@@ -15,7 +15,7 @@
 
 use std::io::{BufReader, Cursor, Read};
 
-use serde::Deserialize;
+use serde::{Deserialize, de::IntoDeserializer};
 
 use crate::{Error, Result, constants::*};
 
@@ -25,6 +25,7 @@ pub struct Decoder<R: Read> {
     max_allocation: Option<usize>,
     recursion_depth: usize,
     max_recursion_depth: usize,
+    current_tag: Option<u64>,
 }
 
 /// Safely convert u64 to usize, checking for overflow on 32-bit platforms
@@ -62,6 +63,7 @@ impl<R: Read> Decoder<R> {
             max_allocation: None,
             recursion_depth: 0,
             max_recursion_depth: DEFAULT_MAX_DEPTH,
+            current_tag: None,
         }
     }
 
@@ -180,7 +182,7 @@ impl<R: Read> Decoder<R> {
         })
     }
 
-    fn peek_u8(&mut self) -> Result<u8> {
+    pub(crate) fn peek_u8(&mut self) -> Result<u8> {
         if let Some(byte) = self.peeked {
             return Ok(byte);
         }
@@ -382,12 +384,23 @@ impl<R: Read> Decoder<R> {
             }
             MAJOR_TAG => {
                 // Read the tag number
-                let _tag = self
+                let tag = self
                     .read_length(info)?
                     .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
-                // For now, just deserialize the tagged content
-                // The tag information is available but we pass through to the content
-                self.deserialize_any_impl(visitor)
+                // Store the tag
+                self.current_tag = Some(tag);
+
+                // For maximum compatibility: try visit_map first (for Tagged<T>),
+                // and if that fails, fall back to transparent pass-through (for String, i64, etc.)
+                // We create a special deserializer that tries both approaches
+                let result = serde::Deserializer::deserialize_any(
+                    TaggedValueDeserializer { de: self, tag },
+                    visitor,
+                );
+
+                // Clear the tag after deserialization
+                self.current_tag = None;
+                result
             }
             MAJOR_SIMPLE => match info {
                 FALSE => visitor.visit_bool(false),
@@ -464,7 +477,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf unit unit_struct newtype_struct seq tuple
-        tuple_struct map struct identifier ignored_any
+        tuple_struct struct identifier ignored_any
     }
 
     fn deserialize_option<V: serde::de::Visitor<'de>>(mut self, visitor: V) -> Result<V::Value> {
@@ -524,6 +537,29 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
     ) -> Result<V::Value> {
         self.deserialize_enum_impl(visitor)
     }
+
+    fn deserialize_map<V: serde::de::Visitor<'de>>(mut self, visitor: V) -> Result<V::Value> {
+        // Check for CBOR tag - if present, use TaggedValueDeserializer.deserialize_map
+        let peek = self.peek_u8()?;
+        let major = peek >> 5;
+
+        if major == MAJOR_TAG {
+            // Read the tag
+            let initial = self.read_u8()?;
+            let info = initial & 0x1f;
+            let tag = self
+                .read_length(info)?
+                .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
+
+            self.current_tag = Some(tag);
+            let result = TaggedValueDeserializer { de: &mut self, tag }.deserialize_map(visitor);
+            self.current_tag = None;
+            result
+        } else {
+            // No tag, process as normal map
+            self.deserialize_any_impl(visitor)
+        }
+    }
 }
 
 impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
@@ -532,7 +568,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf unit unit_struct seq tuple
-        tuple_struct map struct identifier ignored_any
+        tuple_struct struct identifier ignored_any
     }
 
     fn deserialize_option<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -602,6 +638,29 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         // Newtype structs are serialized transparently (just the inner value)
         // This is serde's standard behavior - the newtype wrapper is not encoded in CBOR
         visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_map<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        // Check for CBOR tag - if present, use TaggedValueDeserializer.deserialize_map
+        let peek = self.peek_u8()?;
+        let major = peek >> 5;
+
+        if major == MAJOR_TAG {
+            // Read the tag
+            let initial = self.read_u8()?;
+            let info = initial & 0x1f;
+            let tag = self
+                .read_length(info)?
+                .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
+
+            self.current_tag = Some(tag);
+            let result = TaggedValueDeserializer { de: self, tag }.deserialize_map(visitor);
+            self.current_tag = None;
+            result
+        } else {
+            // No tag, process as normal map
+            self.deserialize_any_impl(visitor)
+        }
     }
 }
 
@@ -692,6 +751,54 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 })?;
                 let buf = self.de.read_bytes(u64_to_usize(len)?)?;
                 visitor.visit_byte_buf(buf)
+            }
+            MAJOR_ARRAY => {
+                self.de.check_recursion_depth()?;
+                self.de.recursion_depth += 1;
+                match self.de.read_length(self.info)? {
+                    Some(len) => visitor.visit_seq(SeqAccess {
+                        de: self.de,
+                        remaining: Some(u64_to_usize(len)?),
+                    }),
+                    None => visitor.visit_seq(SeqAccess {
+                        de: self.de,
+                        remaining: None,
+                    }),
+                }
+                // Note: recursion_depth is decremented in SeqAccess::drop
+            }
+            MAJOR_MAP => {
+                self.de.check_recursion_depth()?;
+                self.de.recursion_depth += 1;
+                match self.de.read_length(self.info)? {
+                    Some(len) => visitor.visit_map(MapAccess {
+                        de: self.de,
+                        remaining: Some(u64_to_usize(len)?),
+                    }),
+                    None => visitor.visit_map(MapAccess {
+                        de: self.de,
+                        remaining: None,
+                    }),
+                }
+                // Note: recursion_depth is decremented in MapAccess::drop
+            }
+            MAJOR_TAG => {
+                // Read the tag number
+                let tag = self.de.read_length(self.info)?.ok_or_else(|| {
+                    Error::Syntax("Tag cannot be indefinite".to_string())
+                })?;
+                // Store the tag
+                self.de.current_tag = Some(tag);
+
+                // Deserialize the tagged content using TaggedValueDeserializer
+                let result = serde::Deserializer::deserialize_any(
+                    TaggedValueDeserializer { de: self.de, tag },
+                    visitor,
+                );
+
+                // Clear the tag after deserialization
+                self.de.current_tag = None;
+                result
             }
             MAJOR_SIMPLE => match self.info {
                 FALSE => visitor.visit_bool(false),
@@ -879,6 +986,207 @@ impl<'de, 'a, R: Read> serde::de::MapAccess<'de> for MapAccess<'a, R> {
 
     fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
         seed.deserialize(&mut *self.de)
+    }
+}
+
+// Helper deserializer that wraps tagged CBOR values
+// This provides tag information to Tagged<T> while allowing other types to deserialize normally
+struct TaggedValueDeserializer<'a, R: Read> {
+    de: &'a mut Decoder<R>,
+    tag: u64,
+}
+
+impl<'de, 'a, R: Read> serde::Deserializer<'de> for TaggedValueDeserializer<'a, R> {
+    type Error = crate::Error;
+
+    // Forward less common types to deserialize_any
+    serde::forward_to_deserialize_any! {
+        unit unit_struct newtype_struct seq tuple tuple_struct
+        enum identifier ignored_any
+    }
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        // For deserialize_any, we provide transparent tag handling by default
+        // This allows String, i64, etc. to work with tagged CBOR
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    // Implement specific type deserializations to ignore tags (transparent behavior)
+    // This allows plain types like String, i64 to deserialize from tagged CBOR
+
+    fn deserialize_bool<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_i8<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_i16<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_i32<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_i64<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_i128<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_u8<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_u16<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_u32<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_u64<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_u128<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_f32<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_f64<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_char<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_str<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_string<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_bytes<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_byte_buf<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value> {
+        // Struct deserialization - pass through to content
+        self.de.deserialize_any_impl(visitor)
+    }
+
+    fn deserialize_map<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        // When explicitly deserializing as a map, provide the virtual tag map
+        // This is for Tagged<T> when it calls deserialize_map
+        visitor.visit_map(TaggedMapAccess {
+            de: self.de,
+            tag: self.tag,
+            state: TaggedMapState::BeforeTag,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum TaggedMapState {
+    BeforeTag,
+    AfterTag,
+    BeforeValue,
+    Done,
+}
+
+struct TaggedMapAccess<'a, R: Read> {
+    de: &'a mut Decoder<R>,
+    tag: u64,
+    state: TaggedMapState,
+}
+
+impl<'de, 'a, R: Read> serde::de::MapAccess<'de> for TaggedMapAccess<'a, R> {
+    type Error = crate::Error;
+
+    fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>> {
+        match self.state {
+            TaggedMapState::BeforeTag => {
+                self.state = TaggedMapState::AfterTag;
+                seed.deserialize("tag".into_deserializer()).map(Some)
+            }
+            TaggedMapState::BeforeValue => {
+                self.state = TaggedMapState::Done;
+                seed.deserialize("value".into_deserializer()).map(Some)
+            }
+            TaggedMapState::AfterTag | TaggedMapState::Done => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
+        match self.state {
+            TaggedMapState::AfterTag => {
+                // Return the tag number wrapped in Some for TaggedHelper
+                self.state = TaggedMapState::BeforeValue;
+
+                // Create a deserializer that provides Some(tag)
+                struct SomeU64Deserializer(u64);
+                impl<'de> serde::Deserializer<'de> for SomeU64Deserializer {
+                    type Error = crate::Error;
+
+                    serde::forward_to_deserialize_any! {
+                        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                        bytes byte_buf unit unit_struct newtype_struct seq tuple
+                        tuple_struct map struct enum identifier ignored_any
+                    }
+
+                    fn deserialize_any<V: serde::de::Visitor<'de>>(
+                        self,
+                        visitor: V,
+                    ) -> Result<V::Value> {
+                        visitor.visit_some(self.0.into_deserializer())
+                    }
+
+                    fn deserialize_option<V: serde::de::Visitor<'de>>(
+                        self,
+                        visitor: V,
+                    ) -> Result<V::Value> {
+                        visitor.visit_some(self.0.into_deserializer())
+                    }
+                }
+
+                seed.deserialize(SomeU64Deserializer(self.tag))
+            }
+            TaggedMapState::Done => {
+                // Return the actual value from the CBOR stream
+                seed.deserialize(&mut *self.de)
+            }
+            _ => Err(Error::Syntax(
+                "invalid state in TaggedMapAccess".to_string(),
+            )),
+        }
     }
 }
 
