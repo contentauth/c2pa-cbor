@@ -377,7 +377,7 @@ jobs:
         run: cargo codspeed build -p c2pa_cbor --all-features
 
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v4.14.0
         with:
           mode: instrumentation
           run: cargo codspeed run
