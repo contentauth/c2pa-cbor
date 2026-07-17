@@ -81,10 +81,12 @@ impl Serialize for Value {
             Value::Text(s) => serializer.serialize_str(s),
             Value::Array(a) => a.serialize(serializer),
             Value::Map(m) => m.serialize(serializer),
-            Value::Tag(_tag, _value) => {
-                // For now, serialize the inner value
-                // Full tag support would require custom CBOR encoding
-                _value.serialize(serializer)
+            Value::Tag(tag, value) => {
+                crate::tags::set_tag(Some(*tag));
+                let result =
+                    serializer.serialize_newtype_struct(crate::tags::TAG_MARKER_NAME, value);
+                crate::tags::set_tag(None);
+                result
             }
         }
     }
@@ -213,6 +215,21 @@ impl<'de> Deserialize<'de> for Value {
                 }
                 Ok(Value::Map(map))
             }
+
+            // Only reached when the decoder is in tag-capturing mode (see
+            // `Value::from_tagged_slice`); the tag number was stashed by the
+            // decoder just before this call.
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let tag = crate::tags::take_tag();
+                let inner = deserializer.deserialize_any(self)?;
+                Ok(match tag {
+                    Some(tag) => Value::Tag(tag, Box::new(inner)),
+                    None => inner,
+                })
+            }
         }
 
         deserializer.deserialize_any(ValueVisitor)
@@ -327,6 +344,32 @@ impl Value {
             Value::Tag(tag, value) => Some((*tag, value)),
             _ => None,
         }
+    }
+
+    /// Deserialize CBOR bytes into a `Value`, reconstructing any CBOR tags
+    /// (major type 6) as `Value::Tag` instead of transparently dropping them.
+    ///
+    /// This differs from decoding a `Value` via [`crate::from_slice`], which
+    /// intentionally ignores tags so that plain types (`String`, `i64`, ...)
+    /// can be decoded straight out of tagged CBOR without a wrapper type.
+    /// That transparent behavior is unavailable in this tag-aware mode, so
+    /// it's only offered for `Value` specifically, not as a general decoder
+    /// option.
+    ///
+    /// # Example
+    /// ```
+    /// use c2pa_cbor::{Value, to_vec};
+    ///
+    /// let tagged = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+    /// let bytes = to_vec(&tagged).unwrap();
+    ///
+    /// let decoded = Value::from_tagged_slice(&bytes).unwrap();
+    /// assert_eq!(decoded, tagged);
+    /// ```
+    pub fn from_tagged_slice(bytes: &[u8]) -> crate::Result<Value> {
+        crate::Decoder::from_slice(bytes)
+            .with_capture_tags(true)
+            .decode()
     }
 }
 
@@ -1222,5 +1265,65 @@ mod tests {
 
         let decoded: ComplexEnum = from_value(value).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_tag_encodes_actual_cbor_tag() {
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+        let bytes = to_vec(&value).unwrap();
+
+        // Tag 32 is encoded as 0xd8 0x20, followed by the text string
+        assert_eq!(bytes[0], 0xd8);
+        assert_eq!(bytes[1], 0x20);
+    }
+
+    #[test]
+    fn test_value_tag_round_trips_via_from_tagged_slice() {
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+        let bytes = to_vec(&value).unwrap();
+
+        let decoded = Value::from_tagged_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_transparent_via_plain_from_slice() {
+        // Plain from_slice (the default, non-tag-aware path) intentionally
+        // drops the tag, matching how any other type transparently ignores
+        // a leading CBOR tag.
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+        let bytes = to_vec(&value).unwrap();
+
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, Value::Text("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_value_tag_nested_round_trips() {
+        let value = Value::Array(vec![
+            Value::Integer(1),
+            Value::Tag(1, Box::new(Value::Integer(1705315800))),
+            Value::Tag(
+                999,
+                Box::new(Value::Map(BTreeMap::from([(
+                    Value::Text("k".to_string()),
+                    Value::Bool(true),
+                )]))),
+            ),
+        ]);
+        let bytes = to_vec(&value).unwrap();
+
+        let decoded = Value::from_tagged_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_arbitrary_tag_number() {
+        // Previously, only a whitelisted set of tag numbers (0-87ish) could
+        // be encoded at all; arbitrary tags now work too.
+        let value = Value::Tag(123456, Box::new(Value::Integer(1)));
+        let bytes = to_vec(&value).unwrap();
+        let decoded = Value::from_tagged_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
     }
 }

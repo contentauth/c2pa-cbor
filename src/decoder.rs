@@ -26,6 +26,12 @@ pub struct Decoder<R: Read> {
     recursion_depth: usize,
     max_recursion_depth: usize,
     current_tag: Option<u64>,
+    /// When true, `deserialize_any_impl` notifies the visitor of a CBOR tag
+    /// via `visit_newtype_struct` instead of transparently skipping past it.
+    /// Only safe for a visitor that implements `visit_newtype_struct` (e.g.
+    /// `Value`'s); see [`crate::Value::from_tagged_slice`]. Left `false` by
+    /// default so plain types keep deserializing straight out of tagged CBOR.
+    capture_tags: bool,
 }
 
 /// Safely convert u64 to usize, checking for overflow on 32-bit platforms
@@ -64,7 +70,17 @@ impl<R: Read> Decoder<R> {
             recursion_depth: 0,
             max_recursion_depth: DEFAULT_MAX_DEPTH,
             current_tag: None,
+            capture_tags: false,
         }
+    }
+
+    /// Enable tag-capturing mode (builder pattern): notify the visitor of
+    /// CBOR tags via `visit_newtype_struct` instead of transparently
+    /// skipping past them. Only used internally by
+    /// [`crate::Value::from_tagged_slice`].
+    pub(crate) fn with_capture_tags(mut self, capture: bool) -> Self {
+        self.capture_tags = capture;
+        self
     }
 
     /// Set the maximum allocation size for a single CBOR value (builder pattern)
@@ -390,13 +406,22 @@ impl<R: Read> Decoder<R> {
                 // Store the tag
                 self.current_tag = Some(tag);
 
-                // For maximum compatibility: try visit_map first (for Tagged<T>),
-                // and if that fails, fall back to transparent pass-through (for String, i64, etc.)
-                // We create a special deserializer that tries both approaches
-                let result = serde::Deserializer::deserialize_any(
-                    TaggedValueDeserializer { de: self, tag },
-                    visitor,
-                );
+                let result = if self.capture_tags {
+                    // Tag-aware mode: notify the visitor via
+                    // visit_newtype_struct so it can reconstruct the tag
+                    // (used by Value::from_tagged_slice). Only safe for a
+                    // visitor that implements visit_newtype_struct.
+                    crate::tags::set_tag(Some(tag));
+                    visitor.visit_newtype_struct(TaggedValueDeserializer { de: self, tag })
+                } else {
+                    // For maximum compatibility: try visit_map first (for Tagged<T>),
+                    // and if that fails, fall back to transparent pass-through (for String, i64, etc.)
+                    // We create a special deserializer that tries both approaches
+                    serde::Deserializer::deserialize_any(
+                        TaggedValueDeserializer { de: self, tag },
+                        visitor,
+                    )
+                };
 
                 // Clear the tag after deserialization
                 self.current_tag = None;

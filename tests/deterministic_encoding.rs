@@ -140,6 +140,54 @@ fn encoder_set_deterministic_false_matches_to_vec_unordered() {
 }
 
 #[test]
+fn duplicate_keys_are_rejected_in_deterministic_mode() {
+    // #[serde(flatten)] can produce a map with a key that collides with a
+    // sibling field's name; RFC 8949 §4.2.1 forbids duplicate keys.
+    #[derive(Serialize)]
+    struct Outer {
+        name: String,
+        #[serde(flatten)]
+        extra: HashMap<String, String>,
+    }
+
+    let mut extra = HashMap::new();
+    extra.insert("name".to_string(), "duplicate!".to_string());
+    let outer = Outer {
+        name: "original".to_string(),
+        extra,
+    };
+
+    let err = to_vec(&outer).unwrap_err();
+    assert!(err.to_string().contains("duplicate"), "{}", err);
+}
+
+#[test]
+fn duplicate_keys_are_allowed_in_unordered_mode() {
+    use std::collections::HashMap;
+
+    #[derive(Serialize)]
+    struct Outer {
+        name: String,
+        #[serde(flatten)]
+        extra: HashMap<String, String>,
+    }
+
+    let mut extra = HashMap::new();
+    extra.insert("name".to_string(), "duplicate!".to_string());
+    let outer = Outer {
+        name: "original".to_string(),
+        extra,
+    };
+
+    // Duplicate-key rejection only applies in deterministic mode.
+    let bytes = to_vec_unordered(&outer).unwrap();
+    assert_eq!(
+        hex(&bytes),
+        "a2646e616d65686f726967696e616c646e616d656a6475706c696361746521"
+    );
+}
+
+#[test]
 fn nested_maps_are_sorted_recursively() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct Inner {

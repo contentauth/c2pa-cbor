@@ -261,13 +261,11 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     where
         T: ?Sized + Serialize,
     {
-        // Check if this is a special CBOR tag marker from Tagged<T>
-        if let Some(tag_str) = name.strip_prefix("__cbor_tag_")
-            && let Some(tag_num_str) = tag_str.strip_suffix("__")
-            && let Ok(tag) = tag_num_str.parse::<u64>()
-        {
-            // Write the CBOR tag and then serialize the value
-            self.write_tag(tag)?;
+        // Check if this is the special CBOR tag marker from Tagged<T>/Value::Tag
+        if name == crate::tags::TAG_MARKER_NAME {
+            if let Some(tag) = crate::tags::take_tag() {
+                self.write_tag(tag)?;
+            }
             return value.serialize(self);
         }
 
@@ -408,6 +406,11 @@ impl<'a, W: Write> serde::ser::SerializeStructVariant for SerializeStructVariant
         } = self;
         if encoder.deterministic {
             buffer.sort_by(|a, b| a.0.cmp(&b.0));
+            if buffer.windows(2).any(|w| w[0].0 == w[1].0) {
+                return Err(Error::Message(
+                    "duplicate map key in deterministic CBOR encoding".to_string(),
+                ));
+            }
         }
         encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
         for (key_bytes, value_bytes) in buffer {
@@ -660,8 +663,15 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 // lexicographic order of their encoded bytes. `Vec<u8>`'s
                 // `Ord` is already a byte-for-byte lexicographic comparison,
                 // so sorting on the encoded key bytes directly satisfies this.
+                // The RFC also disallows duplicate keys, so that's only
+                // checked in this same deterministic mode.
                 if encoder.deterministic {
                     buffer.sort_by(|a, b| a.0.cmp(&b.0));
+                    if buffer.windows(2).any(|w| w[0].0 == w[1].0) {
+                        return Err(Error::Message(
+                            "duplicate map key in deterministic CBOR encoding".to_string(),
+                        ));
+                    }
                 }
                 // Write definite-length map header now that we know the count
                 encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
