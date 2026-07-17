@@ -19,12 +19,17 @@
 //!
 //! ## Architecture
 //!
-//! This library uses a **dual-path serialization strategy** for optimal performance:
-//!
-//! - **Fast path**: When collection sizes are known at compile time (the common case),
-//!   data is written directly to the output with zero buffering overhead.
-//! - **Buffering path**: When sizes are unknown (e.g., `#[serde(flatten)]` in `serde_transcode`),
-//!   entries are buffered in memory and written as definite-length once the count is known.
+//! - **Arrays**: When the length is known at compile time (the common case), data is
+//!   written directly to the output with zero buffering overhead. Unknown-length
+//!   sequences (e.g., custom iterators) are buffered and written as definite-length
+//!   once the count is known.
+//! - **Maps and structs**: Entries are always buffered and written in the
+//!   bytewise-lexicographic order of their encoded key bytes, satisfying RFC 8949
+//!   §4.2.1's Core Deterministic Encoding Requirement, which C2PA requires. This
+//!   applies regardless of source order (struct field declaration order, `HashMap`
+//!   iteration order, etc.). Use [`crate::to_vec_unordered`] / [`crate::to_writer_unordered`]
+//!   or [`Encoder::set_deterministic`] to opt out and restore the original
+//!   unsorted, unbuffered fast path.
 //!
 //! This design maintains C2PA's requirement for deterministic, definite-length encoding
 //! while supporting the full serde data model including complex features like flatten.
@@ -85,7 +90,7 @@ pub mod error;
 pub use error::{Error, Result};
 
 pub mod encoder;
-pub use encoder::{Encoder, to_vec, to_writer};
+pub use encoder::{Encoder, to_vec, to_vec_unordered, to_writer, to_writer_unordered};
 
 pub mod decoder;
 // Re-export DOS protection constants for user configuration

@@ -22,11 +22,30 @@ use crate::{Error, Result, constants::*};
 // Encoder
 pub struct Encoder<W: Write> {
     writer: W,
+    /// When true (the default), map and struct entries are buffered and
+    /// written in the bytewise-lexicographic order of their encoded keys,
+    /// per RFC 8949 §4.2.1's Core Deterministic Encoding Requirement.
+    deterministic: bool,
 }
 
 impl<W: Write> Encoder<W> {
     pub fn new(writer: W) -> Self {
-        Encoder { writer }
+        Encoder {
+            writer,
+            deterministic: true,
+        }
+    }
+
+    /// Disable RFC 8949 §4.2.1 map-key sorting, restoring the original
+    /// unsorted, unbuffered fast path for maps and structs.
+    ///
+    /// C2PA requires deterministic encoding, so this is not suitable for
+    /// producing C2PA manifests. It exists for callers who need to match
+    /// serde's declaration/insertion order instead (e.g. byte-for-byte
+    /// compatibility with another encoder) and are willing to give that up.
+    pub fn set_deterministic(mut self, deterministic: bool) -> Self {
+        self.deterministic = deterministic;
+        self
     }
 
     /// Consume the encoder and return the inner writer
@@ -111,7 +130,7 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     type SerializeMap = SerializeVec<'a, W>;
     type SerializeSeq = SerializeVec<'a, W>;
     type SerializeStruct = SerializeVec<'a, W>;
-    type SerializeStructVariant = &'a mut Encoder<W>;
+    type SerializeStructVariant = SerializeStructVariantBuf<'a, W>;
     type SerializeTuple = SerializeVec<'a, W>;
     type SerializeTupleStruct = SerializeVec<'a, W>;
     type SerializeTupleVariant = &'a mut Encoder<W>;
@@ -315,22 +334,22 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
-        match len {
-            Some(len) => {
-                // Fast path: length known, write header immediately (no buffering)
-                self.write_type_value(MAJOR_MAP, len as u64)?;
-                Ok(SerializeVec::Direct { encoder: self })
-            }
-            None => {
-                // Slow path: length unknown, buffer key-value pairs until end()
-                // Happens with #[serde(flatten)] or custom map-like types in serde_transcode
-                Ok(SerializeVec::Map {
-                    encoder: self,
-                    buffer: Vec::new(),
-                    pending_key: None,
-                })
-            }
+        // Deterministic encoding requires sorting entries by their encoded key
+        // bytes, which is only possible once every entry has been serialized,
+        // so it always buffers regardless of whether the length is known.
+        if !self.deterministic
+            && let Some(len) = len
+        {
+            // Fast path: length known, write header immediately (no buffering)
+            self.write_type_value(MAJOR_MAP, len as u64)?;
+            return Ok(SerializeVec::Direct { encoder: self });
         }
+        // Slow path: buffer key-value pairs until end()
+        Ok(SerializeVec::Map {
+            encoder: self,
+            buffer: Vec::new(),
+            pending_key: None,
+        })
     }
 
     fn serialize_struct(self, _name: &'static str, len: usize) -> Result<Self::SerializeStruct> {
@@ -347,12 +366,55 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
         _name: &'static str,
         _variant_index: u32,
         variant: &'static str,
-        len: usize,
+        _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
         self.write_type_value(MAJOR_MAP, 1)?;
         variant.serialize(&mut *self)?;
-        self.write_type_value(MAJOR_MAP, len as u64)?;
-        Ok(self)
+        Ok(SerializeStructVariantBuf {
+            encoder: self,
+            buffer: Vec::new(),
+        })
+    }
+}
+
+/// Buffers the fields of a struct variant so they can be written in
+/// deterministic (sorted-by-key) order once all fields are known, matching
+/// the same requirement enforced for plain maps and structs.
+pub struct SerializeStructVariantBuf<'a, W: Write> {
+    encoder: &'a mut Encoder<W>,
+    buffer: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl<'a, W: Write> serde::ser::SerializeStructVariant for SerializeStructVariantBuf<'a, W> {
+    type Error = crate::Error;
+    type Ok = ();
+
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
+        let deterministic = self.encoder.deterministic;
+        let key_bytes = SerializeVec::<W>::serialize_to_buffer(&key, deterministic)?;
+        let value_bytes = SerializeVec::<W>::serialize_to_buffer(value, deterministic)?;
+        self.buffer.push((key_bytes, value_bytes));
+        Ok(())
+    }
+
+    fn end(self) -> Result<()> {
+        let SerializeStructVariantBuf {
+            encoder,
+            mut buffer,
+        } = self;
+        if encoder.deterministic {
+            buffer.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
+        for (key_bytes, value_bytes) in buffer {
+            SerializeVec::<W>::write_buffered(encoder, &key_bytes)?;
+            SerializeVec::<W>::write_buffered(encoder, &value_bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -443,34 +505,17 @@ impl<W: Write> serde::ser::SerializeStruct for &mut Encoder<W> {
     }
 }
 
-impl<W: Write> serde::ser::SerializeStructVariant for &mut Encoder<W> {
-    type Error = crate::Error;
-    type Ok = ();
-
-    fn serialize_field<T: ?Sized + Serialize>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> Result<()> {
-        key.serialize(&mut **self)?;
-        value.serialize(&mut **self)
-    }
-
-    fn end(self) -> Result<()> {
-        Ok(())
-    }
-}
-
 // Implementations for SerializeVec (handles buffering for unknown-length collections)
 
 impl<'a, W: Write> SerializeVec<'a, W> {
-    /// Serialize a value to a buffer for later writing
-    fn serialize_to_buffer<T>(value: &T) -> Result<Vec<u8>>
+    /// Serialize a value to a buffer for later writing, inheriting the
+    /// outer encoder's determinism setting for any nested maps/structs
+    fn serialize_to_buffer<T>(value: &T, deterministic: bool) -> Result<Vec<u8>>
     where
         T: ?Sized + Serialize,
     {
         let mut buf = Vec::new();
-        let mut encoder = Encoder::new(&mut buf);
+        let mut encoder = Encoder::new(&mut buf).set_deterministic(deterministic);
         value.serialize(&mut encoder)?;
         Ok(buf)
     }
@@ -492,8 +537,8 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
     {
         match self {
             SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
-            SerializeVec::Array { buffer, .. } => {
-                buffer.push(Self::serialize_to_buffer(value)?);
+            SerializeVec::Array { encoder, buffer } => {
+                buffer.push(Self::serialize_to_buffer(value, encoder.deterministic)?);
                 Ok(())
             }
             SerializeVec::Map { .. } => Err(Error::Message(
@@ -557,8 +602,12 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
     {
         match self {
             SerializeVec::Direct { encoder } => key.serialize(&mut **encoder),
-            SerializeVec::Map { pending_key, .. } => {
-                *pending_key = Some(Self::serialize_to_buffer(key)?);
+            SerializeVec::Map {
+                pending_key,
+                encoder,
+                ..
+            } => {
+                *pending_key = Some(Self::serialize_to_buffer(key, encoder.deterministic)?);
                 Ok(())
             }
             SerializeVec::Array { .. } => Err(Error::Message(
@@ -576,9 +625,9 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
             SerializeVec::Map {
                 buffer,
                 pending_key,
-                ..
+                encoder,
             } => {
-                let value_bytes = Self::serialize_to_buffer(value)?;
+                let value_bytes = Self::serialize_to_buffer(value, encoder.deterministic)?;
                 if let Some(key_bytes) = pending_key.take() {
                     buffer.push((key_bytes, value_bytes));
                     Ok(())
@@ -599,13 +648,20 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
             SerializeVec::Direct { .. } => Ok(()),
             SerializeVec::Map {
                 encoder,
-                buffer,
+                mut buffer,
                 pending_key,
             } => {
                 if pending_key.is_some() {
                     return Err(Error::Message(
                         "serialize_key called without serialize_value".to_string(),
                     ));
+                }
+                // RFC 8949 §4.2.1: map keys must be sorted in the bytewise
+                // lexicographic order of their encoded bytes. `Vec<u8>`'s
+                // `Ord` is already a byte-for-byte lexicographic comparison,
+                // so sorting on the encoded key bytes directly satisfies this.
+                if encoder.deterministic {
+                    buffer.sort_by(|a, b| a.0.cmp(&b.0));
                 }
                 // Write definite-length map header now that we know the count
                 encoder.write_type_value(MAJOR_MAP, buffer.len() as u64)?;
@@ -641,11 +697,10 @@ impl<'a, W: Write> serde::ser::SerializeStruct for SerializeVec<'a, W> {
 }
 
 // Convenience functions
-/// Serializes a value to a CBOR byte vector
-pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+fn to_vec_with<T: Serialize>(value: &T, deterministic: bool) -> Result<Vec<u8>> {
     // Try direct serialization first
     let mut buf = Vec::new();
-    let mut encoder = Encoder::new(&mut buf);
+    let mut encoder = Encoder::new(&mut buf).set_deterministic(deterministic);
     match encoder.encode(value) {
         Ok(()) => Ok(buf),
         Err(Error::Message(ref msg)) if msg.contains("indefinite-length") => {
@@ -653,7 +708,7 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
             // This handles #[serde(flatten)] and other cases where size is unknown
             let value = crate::value::to_value(value)?;
             buf.clear();
-            let mut encoder = Encoder::new(&mut buf);
+            let mut encoder = Encoder::new(&mut buf).set_deterministic(deterministic);
             encoder.encode(&value)?;
             Ok(buf)
         }
@@ -661,9 +716,36 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     }
 }
 
-/// Serializes a value to a CBOR writer
+/// Serializes a value to a CBOR byte vector.
+///
+/// Map and struct keys are written in the bytewise-lexicographic order of
+/// their encoded bytes, per RFC 8949 §4.2.1, as required by C2PA.
+pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    to_vec_with(value, true)
+}
+
+/// Like [`to_vec`], but preserves declaration/insertion order for map and
+/// struct keys instead of sorting them. Not suitable for producing C2PA
+/// manifests, which require deterministic encoding.
+pub fn to_vec_unordered<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    to_vec_with(value, false)
+}
+
+/// Serializes a value to a CBOR writer.
+///
+/// Map and struct keys are written in the bytewise-lexicographic order of
+/// their encoded bytes, per RFC 8949 §4.2.1, as required by C2PA.
 pub fn to_writer<W: Write, T: Serialize>(writer: W, value: &T) -> Result<()> {
     let mut encoder = Encoder::new(writer);
+    encoder.encode(value)?;
+    Ok(())
+}
+
+/// Like [`to_writer`], but preserves declaration/insertion order for map and
+/// struct keys instead of sorting them. Not suitable for producing C2PA
+/// manifests, which require deterministic encoding.
+pub fn to_writer_unordered<W: Write, T: Serialize>(writer: W, value: &T) -> Result<()> {
+    let mut encoder = Encoder::new(writer).set_deterministic(false);
     encoder.encode(value)?;
     Ok(())
 }
