@@ -829,6 +829,23 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
             MAJOR_SIMPLE => match self.info {
                 FALSE => visitor.visit_bool(false),
                 TRUE => visitor.visit_bool(true),
+                UNDEFINED => visitor.visit_unit(),
+                FLOAT16 => {
+                    let mut buf = [0u8; 2];
+                    self.de.reader.read_exact(&mut buf)?;
+                    let f16_value = half::f16::from_be_bytes(buf);
+                    visitor.visit_f32(f16_value.to_f32())
+                }
+                FLOAT32 => {
+                    let mut buf = [0u8; 4];
+                    self.de.reader.read_exact(&mut buf)?;
+                    visitor.visit_f32(f32::from_be_bytes(buf))
+                }
+                FLOAT64 => {
+                    let mut buf = [0u8; 8];
+                    self.de.reader.read_exact(&mut buf)?;
+                    visitor.visit_f64(f64::from_be_bytes(buf))
+                }
                 _ => Err(Error::Syntax("Invalid simple type in option".to_string())),
             },
             _ => Err(Error::Syntax("Unsupported type in option".to_string())),
