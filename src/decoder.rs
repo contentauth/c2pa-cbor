@@ -571,6 +571,10 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
         tuple_struct struct identifier ignored_any
     }
 
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+
     fn deserialize_option<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         // Peek at next byte - check for CBOR null (0xf6)
         let initial = self.read_u8()?;

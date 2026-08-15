@@ -116,6 +116,10 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     type SerializeTupleStruct = SerializeVec<'a, W>;
     type SerializeTupleVariant = &'a mut Encoder<W>;
 
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+
     fn serialize_bool(self, v: bool) -> Result<()> {
         let val = if v { TRUE } else { FALSE };
         self.writer.write_all(&[(MAJOR_SIMPLE << 5) | val])?;
