@@ -22,9 +22,10 @@ use crate::{Error, Result, constants::*};
 // Encoder
 pub struct Encoder<W: Write> {
     writer: W,
-    /// When true (the default), map and struct entries are buffered and
-    /// written in the bytewise-lexicographic order of their encoded keys,
-    /// per RFC 8949 §4.2.1's Core Deterministic Encoding Requirement.
+    /// When true, map and struct entries are buffered and written in the
+    /// bytewise-lexicographic order of their encoded keys, per RFC 8949
+    /// §4.2.1's Core Deterministic Encoding Requirement. Defaults to false,
+    /// preserving the original unsorted, unbuffered fast path.
     deterministic: bool,
 }
 
@@ -32,17 +33,19 @@ impl<W: Write> Encoder<W> {
     pub fn new(writer: W) -> Self {
         Encoder {
             writer,
-            deterministic: true,
+            deterministic: false,
         }
     }
 
-    /// Disable RFC 8949 §4.2.1 map-key sorting, restoring the original
-    /// unsorted, unbuffered fast path for maps and structs.
+    /// Enable RFC 8949 §4.2.1 map-key sorting: map and struct entries are
+    /// buffered and written in the bytewise-lexicographic order of their
+    /// encoded keys (and duplicate keys are rejected), regardless of source
+    /// order (struct field declaration order, `HashMap` iteration order,
+    /// etc.).
     ///
-    /// C2PA requires deterministic encoding, so this is not suitable for
-    /// producing C2PA manifests. It exists for callers who need to match
-    /// serde's declaration/insertion order instead (e.g. byte-for-byte
-    /// compatibility with another encoder) and are willing to give that up.
+    /// C2PA requires this for manifests. It is off by default because it
+    /// requires buffering and isn't needed by callers who only care about
+    /// round-tripping through this crate.
     pub fn set_deterministic(mut self, deterministic: bool) -> Self {
         self.deterministic = deterministic;
         self
@@ -726,36 +729,40 @@ fn to_vec_with<T: Serialize>(value: &T, deterministic: bool) -> Result<Vec<u8>> 
     }
 }
 
-/// Serializes a value to a CBOR byte vector.
+/// Serializes a value to a CBOR byte vector, preserving declaration/insertion
+/// order for map and struct keys (the original unsorted, unbuffered fast
+/// path).
 ///
-/// Map and struct keys are written in the bytewise-lexicographic order of
-/// their encoded bytes, per RFC 8949 §4.2.1, as required by C2PA.
+/// C2PA manifests require deterministic (sorted-key) encoding; use
+/// [`to_vec_deterministic`] or [`Encoder::set_deterministic`] for that.
 pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    to_vec_with(value, true)
-}
-
-/// Like [`to_vec`], but preserves declaration/insertion order for map and
-/// struct keys instead of sorting them. Not suitable for producing C2PA
-/// manifests, which require deterministic encoding.
-pub fn to_vec_unordered<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     to_vec_with(value, false)
 }
 
-/// Serializes a value to a CBOR writer.
+/// Like [`to_vec`], but map and struct keys are written in the
+/// bytewise-lexicographic order of their encoded bytes, per RFC 8949
+/// §4.2.1, as required by C2PA.
+pub fn to_vec_deterministic<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    to_vec_with(value, true)
+}
+
+/// Serializes a value to a CBOR writer, preserving declaration/insertion
+/// order for map and struct keys (the original unsorted, unbuffered fast
+/// path).
 ///
-/// Map and struct keys are written in the bytewise-lexicographic order of
-/// their encoded bytes, per RFC 8949 §4.2.1, as required by C2PA.
+/// C2PA manifests require deterministic (sorted-key) encoding; use
+/// [`to_writer_deterministic`] or [`Encoder::set_deterministic`] for that.
 pub fn to_writer<W: Write, T: Serialize>(writer: W, value: &T) -> Result<()> {
     let mut encoder = Encoder::new(writer);
     encoder.encode(value)?;
     Ok(())
 }
 
-/// Like [`to_writer`], but preserves declaration/insertion order for map and
-/// struct keys instead of sorting them. Not suitable for producing C2PA
-/// manifests, which require deterministic encoding.
-pub fn to_writer_unordered<W: Write, T: Serialize>(writer: W, value: &T) -> Result<()> {
-    let mut encoder = Encoder::new(writer).set_deterministic(false);
+/// Like [`to_writer`], but map and struct keys are written in the
+/// bytewise-lexicographic order of their encoded bytes, per RFC 8949
+/// §4.2.1, as required by C2PA.
+pub fn to_writer_deterministic<W: Write, T: Serialize>(writer: W, value: &T) -> Result<()> {
+    let mut encoder = Encoder::new(writer).set_deterministic(true);
     encoder.encode(value)?;
     Ok(())
 }

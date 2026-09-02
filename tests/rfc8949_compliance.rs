@@ -16,22 +16,22 @@
 //!
 //! ## Test Status
 //!
-//! ✅ **ALL TESTS PASSING (11/11 test groups)** - 100% RFC 8949 Compliant!
+//! **ALL TESTS PASSING (11/11 test groups)** - 100% RFC 8949 Compliant!
 //!
 //! Note: These tests require the `compact_floats` feature to pass, as RFC 8949
 //! examples use optimal float encoding (f16/f32/f64 based on precision needed).
 //!
-//! - ✅ Integers (positive and negative)
-//! - ✅ Simple values (bool, null/Option)
-//! - ✅ Floats (with optimal f16/f32/f64 encoding)
-//! - ✅ Text strings (UTF-8 encoded)
-//! - ✅ Byte strings (using serde_bytes::ByteBuf)
-//! - ✅ Arrays (including nested heterogeneous)
-//! - ✅ Maps (with mixed key/value types)
-//! - ✅ Tags (standard CBOR tags 0-5, 21-24, 32-36, 64-87)
-//! - ✅ Newtype structs (transparent serialization - fixed!)
-//! - ✅ Tagged values (proper CBOR tag encoding - fixed!)
-//! - ✅ Value enum roundtrips
+//! - Integers (positive and negative)
+//! - Simple values (bool, null/Option)
+//! - Floats (with optimal f16/f32/f64 encoding)
+//! - Text strings (UTF-8 encoded)
+//! - Byte strings (using serde_bytes::ByteBuf)
+//! - Arrays (including nested heterogeneous)
+//! - Maps (with mixed key/value types)
+//! - Tags (standard CBOR tags 0-5, 21-24, 32-36, 64-87)
+//! - Newtype structs (transparent serialization - fixed!)
+//! - Tagged values (proper CBOR tag encoding - fixed!)
+//! - Value enum roundtrips
 //!
 //! ## Key Features
 //!

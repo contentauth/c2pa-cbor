@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use c2pa_cbor::{Encoder, Value, from_slice, to_vec, to_vec_unordered};
+use c2pa_cbor::{Encoder, Value, from_slice, to_vec, to_vec_deterministic};
 use serde::{Deserialize, Serialize};
 
 fn hex(bytes: &[u8]) -> String {
@@ -44,7 +44,7 @@ fn struct_fields_are_sorted_by_encoded_key_bytes() {
         aa: 4,
     };
 
-    let encoded = to_vec(&s).unwrap();
+    let encoded = to_vec_deterministic(&s).unwrap();
     // Expected key order: "b" (len 1, header sorts lowest), "aa" (len 2),
     // "apple" (len 5), "zebra" (len 5, tie-broken bytewise: 'a' < 'z').
     assert_eq!(
@@ -64,7 +64,7 @@ fn hashmap_keys_are_sorted_regardless_of_insertion_order() {
     map.insert("b".to_string(), 3);
     map.insert("aa".to_string(), 4);
 
-    let encoded = to_vec(&map).unwrap();
+    let encoded = to_vec_deterministic(&map).unwrap();
     assert_eq!(
         hex(&encoded),
         "a461620362616104656170706c6502657a6562726101"
@@ -81,7 +81,7 @@ fn mixed_sign_integer_keys_follow_cbor_byte_order_not_numeric_order() {
     map.insert(Value::Integer(-5), Value::Bool(false));
     let value = Value::Map(map);
 
-    let encoded = to_vec(&value).unwrap();
+    let encoded = to_vec_deterministic(&value).unwrap();
     // {3: true, -5: false} -> a2 03 f5 24 f4
     assert_eq!(hex(&encoded), "a203f524f4");
 }
@@ -94,7 +94,7 @@ fn enum_struct_variant_fields_are_sorted() {
     }
 
     let e = E::Variant { zebra: 1, apple: 2 };
-    let encoded = to_vec(&e).unwrap();
+    let encoded = to_vec_deterministic(&e).unwrap();
     // {"Variant": {"apple": 2, "zebra": 1}}
     assert_eq!(
         hex(&encoded),
@@ -106,7 +106,7 @@ fn enum_struct_variant_fields_are_sorted() {
 }
 
 #[test]
-fn to_vec_unordered_preserves_declaration_order() {
+fn to_vec_preserves_declaration_order_by_default() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct S {
         zebra: i32,
@@ -115,7 +115,7 @@ fn to_vec_unordered_preserves_declaration_order() {
 
     let s = S { zebra: 1, apple: 2 };
 
-    let encoded = to_vec_unordered(&s).unwrap();
+    let encoded = to_vec(&s).unwrap();
     // Declaration order preserved: zebra, then apple.
     assert_eq!(hex(&encoded), "a2657a6562726101656170706c6502");
 
@@ -124,7 +124,7 @@ fn to_vec_unordered_preserves_declaration_order() {
 }
 
 #[test]
-fn encoder_set_deterministic_false_matches_to_vec_unordered() {
+fn encoder_default_matches_to_vec() {
     #[derive(Serialize)]
     struct S {
         zebra: i32,
@@ -133,10 +133,10 @@ fn encoder_set_deterministic_false_matches_to_vec_unordered() {
     let s = S { zebra: 1, apple: 2 };
 
     let mut buf = Vec::new();
-    let mut encoder = Encoder::new(&mut buf).set_deterministic(false);
+    let mut encoder = Encoder::new(&mut buf);
     encoder.encode(&s).unwrap();
 
-    assert_eq!(hex(&buf), hex(&to_vec_unordered(&s).unwrap()));
+    assert_eq!(hex(&buf), hex(&to_vec(&s).unwrap()));
 }
 
 #[test]
@@ -157,12 +157,12 @@ fn duplicate_keys_are_rejected_in_deterministic_mode() {
         extra,
     };
 
-    let err = to_vec(&outer).unwrap_err();
+    let err = to_vec_deterministic(&outer).unwrap_err();
     assert!(err.to_string().contains("duplicate"), "{}", err);
 }
 
 #[test]
-fn duplicate_keys_are_allowed_in_unordered_mode() {
+fn duplicate_keys_are_allowed_by_default() {
     use std::collections::HashMap;
 
     #[derive(Serialize)]
@@ -180,7 +180,7 @@ fn duplicate_keys_are_allowed_in_unordered_mode() {
     };
 
     // Duplicate-key rejection only applies in deterministic mode.
-    let bytes = to_vec_unordered(&outer).unwrap();
+    let bytes = to_vec(&outer).unwrap();
     assert_eq!(
         hex(&bytes),
         "a2646e616d65686f726967696e616c646e616d656a6475706c696361746521"
@@ -205,7 +205,7 @@ fn nested_maps_are_sorted_recursively() {
         a: Inner { z: 3, a: 4 },
     };
 
-    let encoded = to_vec(&outer).unwrap();
+    let encoded = to_vec_deterministic(&outer).unwrap();
     // Outer sorted: a, z. Each inner also sorted: a, z.
     // {"a": {"a": 4, "z": 3}, "z": {"a": 2, "z": 1}}
     assert_eq!(hex(&encoded), "a26161a2616104617a03617aa2616102617a01");

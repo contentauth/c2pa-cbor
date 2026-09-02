@@ -23,16 +23,16 @@
 //!   written directly to the output with zero buffering overhead. Unknown-length
 //!   sequences (e.g., custom iterators) are buffered and written as definite-length
 //!   once the count is known.
-//! - **Maps and structs**: Entries are always buffered and written in the
-//!   bytewise-lexicographic order of their encoded key bytes, satisfying RFC 8949
-//!   §4.2.1's Core Deterministic Encoding Requirement, which C2PA requires. This
-//!   applies regardless of source order (struct field declaration order, `HashMap`
-//!   iteration order, etc.). Use [`crate::to_vec_unordered`] / [`crate::to_writer_unordered`]
-//!   or [`Encoder::set_deterministic`] to opt out and restore the original
-//!   unsorted, unbuffered fast path.
+//! - **Maps and structs**: By default, entries preserve source order (struct field
+//!   declaration order, `HashMap` iteration order, etc.) and are written with an
+//!   unbuffered fast path. Use [`crate::to_vec_deterministic`] / [`crate::to_writer_deterministic`]
+//!   or [`Encoder::set_deterministic`] to opt in to buffering entries and writing them
+//!   in the bytewise-lexicographic order of their encoded key bytes (rejecting duplicate
+//!   keys), satisfying RFC 8949 §4.2.1's Core Deterministic Encoding Requirement, which
+//!   C2PA requires for manifests.
 //!
-//! This design maintains C2PA's requirement for deterministic, definite-length encoding
-//! while supporting the full serde data model including complex features like flatten.
+//! This design supports the full serde data model including complex features like
+//! flatten, while offering opt-in deterministic, definite-length encoding for C2PA.
 //!
 //! ## Features
 //! - Full support for CBOR major types 0-7
@@ -90,7 +90,7 @@ pub mod error;
 pub use error::{Error, Result};
 
 pub mod encoder;
-pub use encoder::{Encoder, to_vec, to_vec_unordered, to_writer, to_writer_unordered};
+pub use encoder::{Encoder, to_vec, to_vec_deterministic, to_writer, to_writer_deterministic};
 
 pub mod decoder;
 // Re-export DOS protection constants for user configuration
