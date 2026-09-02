@@ -22,10 +22,12 @@ use crate::{Error, Result, constants::*};
 // Encoder
 pub struct Encoder<W: Write> {
     writer: W,
-    /// When true, map and struct entries are buffered and written in the
-    /// bytewise-lexicographic order of their encoded keys, per RFC 8949
-    /// §4.2.1's Core Deterministic Encoding Requirement. Defaults to false,
-    /// preserving the original unsorted, unbuffered fast path.
+    /// When true, applies RFC 8949 §4.2.1's Core Deterministic Encoding
+    /// Requirements: map and struct entries are buffered and written in the
+    /// bytewise-lexicographic order of their encoded keys, and floats are
+    /// written in the shortest width (f16/f32/f64) that preserves their
+    /// value, with NaNs canonicalized per §4.2.2. Defaults to false,
+    /// preserving the original unsorted, unbuffered, full-width fast path.
     deterministic: bool,
 }
 
@@ -37,11 +39,13 @@ impl<W: Write> Encoder<W> {
         }
     }
 
-    /// Enable RFC 8949 §4.2.1 map-key sorting: map and struct entries are
-    /// buffered and written in the bytewise-lexicographic order of their
-    /// encoded keys (and duplicate keys are rejected), regardless of source
-    /// order (struct field declaration order, `HashMap` iteration order,
-    /// etc.).
+    /// Enable RFC 8949 §4.2.1's Core Deterministic Encoding Requirements:
+    /// map and struct entries are buffered and written in the
+    /// bytewise-lexicographic order of their encoded keys (and duplicate
+    /// keys are rejected), regardless of source order (struct field
+    /// declaration order, `HashMap` iteration order, etc.); and floats are
+    /// written in the shortest width that preserves their value, with NaNs
+    /// canonicalized to the standard half-precision NaN (`0xf97e00`).
     ///
     /// C2PA requires this for manifests. It is off by default because it
     /// requires buffering and isn't needed by callers who only care about
@@ -98,6 +102,41 @@ impl<W: Write> Encoder<W> {
 
     pub fn encode<T: Serialize>(&mut self, value: &T) -> Result<()> {
         value.serialize(&mut *self)
+    }
+
+    /// Writes `v` in the shortest float width (f16/f32/f64) that preserves
+    /// its value, per RFC 8949 §4.2.1's preferred-serialization requirement.
+    ///
+    /// NaNs are canonicalized to the standard half-precision NaN (0xf97e00)
+    /// rather than preserving the input's sign/payload bits: RFC 8949 §4.2.2
+    /// notes protocols that don't need NaN payloads or signaling NaNs should
+    /// pick a single representation, and C2PA manifests don't rely on either,
+    /// so collapsing every NaN to one encoding keeps output reproducible
+    /// regardless of which bit pattern produced the NaN upstream.
+    fn write_compact_float(&mut self, v: f64) -> Result<()> {
+        if v.is_nan() {
+            self.writer
+                .write_all(&[(MAJOR_SIMPLE << 5) | FLOAT16, 0x7e, 0x00])?;
+            return Ok(());
+        }
+
+        let f16_val = half::f16::from_f64(v);
+        if f16_val.to_f64() == v {
+            self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT16])?;
+            self.writer.write_all(&f16_val.to_be_bytes())?;
+            return Ok(());
+        }
+
+        let f32_val = v as f32;
+        if (f32_val as f64) == v {
+            self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT32])?;
+            self.writer.write_all(&f32_val.to_be_bytes())?;
+            return Ok(());
+        }
+
+        self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT64])?;
+        self.writer.write_all(&v.to_be_bytes())?;
+        Ok(())
     }
 }
 
@@ -181,6 +220,10 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_f32(self, v: f32) -> Result<()> {
+        if self.deterministic || cfg!(feature = "compact_floats") {
+            return self.write_compact_float(v as f64);
+        }
+
         // Encode as CBOR float32 (major type 7, additional info 26)
         self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT32])?;
         self.writer.write_all(&v.to_be_bytes())?;
@@ -188,28 +231,8 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_f64(self, v: f64) -> Result<()> {
-        #[cfg(feature = "compact_floats")]
-        {
-            // Try to encode compactly as f16 first, then f32, fallback to f64
-            // This matches RFC 8949 preferred encoding but may not be compatible with all decoders
-
-            // Try f16 (half precision)
-            let f16_val = half::f16::from_f64(v);
-            if f16_val.to_f64() == v {
-                // Can represent losslessly as f16
-                self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT16])?;
-                self.writer.write_all(&f16_val.to_be_bytes())?;
-                return Ok(());
-            }
-
-            // Try f32 (single precision)
-            let f32_val = v as f32;
-            if (f32_val as f64) == v {
-                // Can represent losslessly as f32
-                self.writer.write_all(&[(MAJOR_SIMPLE << 5) | FLOAT32])?;
-                self.writer.write_all(&f32_val.to_be_bytes())?;
-                return Ok(());
-            }
+        if self.deterministic || cfg!(feature = "compact_floats") {
+            return self.write_compact_float(v);
         }
 
         // Default: Use full f64 (double precision) for maximum compatibility

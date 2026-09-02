@@ -30,6 +30,11 @@
 //!   in the bytewise-lexicographic order of their encoded key bytes (rejecting duplicate
 //!   keys), satisfying RFC 8949 §4.2.1's Core Deterministic Encoding Requirement, which
 //!   C2PA requires for manifests.
+//! - **Floats**: Deterministic mode also applies §4.2.1's preferred-serialization rule
+//!   for floats, writing the shortest width (f16/f32/f64) that preserves the value and
+//!   canonicalizing NaNs to the standard half-precision NaN (`0xf97e00`) per §4.2.2. The
+//!   `compact_floats` feature applies this same shortest-width encoding on the
+//!   non-deterministic fast path as well.
 //!
 //! This design supports the full serde data model including complex features like
 //! flatten, while offering opt-in deterministic, definite-length encoding for C2PA.
@@ -1015,10 +1020,14 @@ mod tests {
 
     #[test]
     fn test_float_serialization() {
-        // Test f32
+        // Test f32 - behavior depends on compact_floats feature
         let f32_val = 4.0f32;
         let encoded = to_vec(&f32_val).unwrap();
         println!("f32 encoded: {:?}", encoded);
+        #[cfg(feature = "compact_floats")]
+        // With compact_floats enabled, 4.0 shrinks losslessly to f16 (FLOAT16 = 25)
+        assert_eq!(encoded[0], (MAJOR_SIMPLE << 5) | 25);
+        #[cfg(not(feature = "compact_floats"))]
         // Should be: major type 7 (0xE0), additional info 26 (0x1A), then 4 bytes
         assert_eq!(encoded[0], (MAJOR_SIMPLE << 5) | 26);
         let decoded: f32 = from_slice(&encoded).unwrap();

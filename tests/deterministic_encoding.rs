@@ -188,6 +188,45 @@ fn duplicate_keys_are_allowed_by_default() {
 }
 
 #[test]
+fn deterministic_mode_uses_preferred_float_encoding_without_compact_floats_feature() {
+    // RFC 8949 §4.2.1's "Core Deterministic Encoding Requirements" bundles
+    // preferred serialization (shortest-form floats) together with sorted
+    // map keys. Deterministic mode must apply both, regardless of whether
+    // the crate was built with the separate `compact_floats` feature.
+    assert_eq!(hex(&to_vec_deterministic(&1.5f64).unwrap()), "f93e00");
+    assert_eq!(hex(&to_vec_deterministic(&4.0f32).unwrap()), "f94400");
+    assert_eq!(
+        hex(&to_vec_deterministic(&1.0e+300f64).unwrap()),
+        "fb7e37e43c8800759c"
+    );
+
+    // Without the `compact_floats` feature, non-deterministic encoding keeps
+    // the original fast path: no shrinking. (With the feature enabled,
+    // `to_vec` shrinks too - that's covered by the `compact_floats` tests.)
+    #[cfg(not(feature = "compact_floats"))]
+    {
+        assert_eq!(hex(&to_vec(&1.5f64).unwrap()), "fb3ff8000000000000");
+        assert_eq!(hex(&to_vec(&4.0f32).unwrap()), "fa40800000");
+    }
+}
+
+#[test]
+fn deterministic_mode_canonicalizes_nan_regardless_of_source_bit_pattern() {
+    // RFC 8949 §4.2.2: protocols that don't need NaN payloads/signaling bits
+    // should pick a single NaN representation (0xf97e00) so output stays
+    // reproducible no matter which bit pattern produced the NaN upstream.
+    let quiet_nan = f64::NAN;
+    let negative_nan = -f64::NAN;
+    let payload_nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let signaling_nan = f64::from_bits(0x7ff0_0000_0000_0001);
+
+    for nan in [quiet_nan, negative_nan, payload_nan, signaling_nan] {
+        assert_eq!(hex(&to_vec_deterministic(&nan).unwrap()), "f97e00");
+        assert_eq!(hex(&to_vec_deterministic(&(nan as f32)).unwrap()), "f97e00");
+    }
+}
+
+#[test]
 fn nested_maps_are_sorted_recursively() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct Inner {
