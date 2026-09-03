@@ -246,13 +246,11 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     where
         T: ?Sized + Serialize,
     {
-        // Check if this is a special CBOR tag marker from Tagged<T>
-        if let Some(tag_str) = name.strip_prefix("__cbor_tag_")
-            && let Some(tag_num_str) = tag_str.strip_suffix("__")
-            && let Ok(tag) = tag_num_str.parse::<u64>()
-        {
-            // Write the CBOR tag and then serialize the value
-            self.write_tag(tag)?;
+        // Check if this is the special CBOR tag marker from Tagged<T>/Value::Tag
+        if name == crate::tags::TAG_MARKER_NAME {
+            if let Some(tag) = crate::tags::take_tag() {
+                self.write_tag(tag)?;
+            }
             return value.serialize(self);
         }
 

@@ -81,10 +81,12 @@ impl Serialize for Value {
             Value::Text(s) => serializer.serialize_str(s),
             Value::Array(a) => a.serialize(serializer),
             Value::Map(m) => m.serialize(serializer),
-            Value::Tag(_tag, _value) => {
-                // For now, serialize the inner value
-                // Full tag support would require custom CBOR encoding
-                _value.serialize(serializer)
+            Value::Tag(tag, value) => {
+                crate::tags::set_tag(Some(*tag));
+                let result =
+                    serializer.serialize_newtype_struct(crate::tags::TAG_MARKER_NAME, value);
+                crate::tags::set_tag(None);
+                result
             }
         }
     }
@@ -95,6 +97,22 @@ impl<'de> Deserialize<'de> for Value {
     where
         D: Deserializer<'de>,
     {
+        // Wraps a freshly-constructed leaf `Value` in `Value::Tag` if a CBOR
+        // tag was just read for it. The decoder stashes any tag number via
+        // `crate::tags::set_tag` immediately before dispatching to whichever
+        // visitor method matches the tagged item's shape (see
+        // `Decoder::deserialize_any_impl`'s `MAJOR_TAG` arm), so draining it
+        // here - as the very first thing each visitor method does - always
+        // captures exactly the tag that applies to this value, never one
+        // belonging to a parent (already consumed further up the call stack)
+        // or a child (not yet read off the wire).
+        fn tagged(value: Value) -> Value {
+            match crate::tags::take_tag() {
+                Some(tag) => Value::Tag(tag, Box::new(value)),
+                None => value,
+            }
+        }
+
         struct ValueVisitor;
 
         impl<'de> Visitor<'de> for ValueVisitor {
@@ -105,113 +123,140 @@ impl<'de> Deserialize<'de> for Value {
             }
 
             fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
-                Ok(Value::Bool(value))
+                Ok(tagged(Value::Bool(value)))
             }
 
             fn visit_i8<E>(self, value: i8) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_i16<E>(self, value: i16) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_i32<E>(self, value: i32) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
-                Ok(Value::Integer(value))
+                Ok(tagged(Value::Integer(value)))
             }
 
             fn visit_u8<E>(self, value: u8) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_u16<E>(self, value: u16) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_u32<E>(self, value: u32) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Value, E>
             where
                 E: de::Error,
             {
+                // Drain the tag before the fallible check below, so it can
+                // never leak into a later, unrelated decode if this errors.
+                let tag = crate::tags::take_tag();
                 if value <= i64::MAX as u64 {
-                    Ok(Value::Integer(value as i64))
+                    Ok(match tag {
+                        Some(tag) => Value::Tag(tag, Box::new(Value::Integer(value as i64))),
+                        None => Value::Integer(value as i64),
+                    })
                 } else {
                     Err(E::custom(format!("u64 value {} too large for i64", value)))
                 }
             }
 
             fn visit_f32<E>(self, value: f32) -> Result<Value, E> {
-                Ok(Value::Float(value as f64))
+                Ok(tagged(Value::Float(value as f64)))
             }
 
             fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
-                Ok(Value::Float(value))
+                Ok(tagged(Value::Float(value)))
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Value, E>
             where
                 E: de::Error,
             {
-                Ok(Value::Text(value.to_owned()))
+                Ok(tagged(Value::Text(value.to_owned())))
             }
 
             fn visit_string<E>(self, value: String) -> Result<Value, E> {
-                Ok(Value::Text(value))
+                Ok(tagged(Value::Text(value)))
             }
 
             fn visit_bytes<E>(self, value: &[u8]) -> Result<Value, E>
             where
                 E: de::Error,
             {
-                Ok(Value::Bytes(value.to_vec()))
+                Ok(tagged(Value::Bytes(value.to_vec())))
             }
 
             fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Value, E> {
-                Ok(Value::Bytes(value))
+                Ok(tagged(Value::Bytes(value)))
             }
 
             fn visit_none<E>(self) -> Result<Value, E> {
-                Ok(Value::Null)
+                Ok(tagged(Value::Null))
             }
 
             fn visit_some<D>(self, deserializer: D) -> Result<Value, D::Error>
             where
                 D: Deserializer<'de>,
             {
-                Deserialize::deserialize(deserializer)
+                // Take the tag before recursing: decoding the wrapped value
+                // may itself see (and consume) a tag of its own.
+                let tag = crate::tags::take_tag();
+                let inner = Deserialize::deserialize(deserializer)?;
+                Ok(match tag {
+                    Some(tag) => Value::Tag(tag, Box::new(inner)),
+                    None => inner,
+                })
             }
 
             fn visit_unit<E>(self) -> Result<Value, E> {
-                Ok(Value::Null)
+                Ok(tagged(Value::Null))
             }
 
             fn visit_seq<V>(self, mut visitor: V) -> Result<Value, V::Error>
             where
                 V: de::SeqAccess<'de>,
             {
+                // Take the tag before iterating: decoding an element may
+                // itself see (and consume) a tag of its own.
+                let tag = crate::tags::take_tag();
                 let mut vec = Vec::new();
                 while let Some(elem) = visitor.next_element()? {
                     vec.push(elem);
                 }
-                Ok(Value::Array(vec))
+                let value = Value::Array(vec);
+                Ok(match tag {
+                    Some(tag) => Value::Tag(tag, Box::new(value)),
+                    None => value,
+                })
             }
 
             fn visit_map<V>(self, mut visitor: V) -> Result<Value, V::Error>
             where
                 V: de::MapAccess<'de>,
             {
+                // Take the tag before iterating: decoding an entry may
+                // itself see (and consume) a tag of its own.
+                let tag = crate::tags::take_tag();
                 let mut map = BTreeMap::new();
                 while let Some((key, value)) = visitor.next_entry()? {
                     map.insert(key, value);
                 }
-                Ok(Value::Map(map))
+                let value = Value::Map(map);
+                Ok(match tag {
+                    Some(tag) => Value::Tag(tag, Box::new(value)),
+                    None => value,
+                })
             }
         }
 
@@ -1222,5 +1267,97 @@ mod tests {
 
         let decoded: ComplexEnum = from_value(value).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_value_tag_encodes_actual_cbor_tag() {
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+        let bytes = to_vec(&value).unwrap();
+
+        // Tag 32 is encoded as 0xd8 0x20, followed by the text string
+        assert_eq!(bytes[0], 0xd8);
+        assert_eq!(bytes[1], 0x20);
+    }
+
+    #[test]
+    fn test_value_tag_round_trips_via_plain_from_slice() {
+        // Regression test for https://github.com/contentauth/c2pa-cbor/issues/27:
+        // Value::Tag previously serialized only its inner value on encode,
+        // and decode never reconstructed Value::Tag at all, so the tag was
+        // silently dropped in both directions.
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+        let bytes = to_vec(&value).unwrap();
+
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_distinguishes_structurally_similar_cose_tags() {
+        // COSE_Mac0 (17), COSE_Sign1 (18), and COSE_Sign (98) are all "an
+        // array of four items" - the tag is the only signal distinguishing
+        // them. Before the fix, every tag was dropped, so all three
+        // collapsed into the same untagged Value.
+        for (bytes, expected_tag) in [
+            (vec![0xd1u8, 0x01], 17u64),  // tag 17 COSE_Mac0
+            (vec![0xd2, 0x01], 18),       // tag 18 COSE_Sign1
+            (vec![0xd8, 0x62, 0x01], 98), // tag 98 COSE_Sign
+        ] {
+            let decoded: Value = from_slice(&bytes).unwrap();
+            assert_eq!(
+                decoded,
+                Value::Tag(expected_tag, Box::new(Value::Integer(1)))
+            );
+            assert!(decoded.is_tag());
+        }
+    }
+
+    #[test]
+    fn test_value_tag_nested_round_trips() {
+        let value = Value::Array(vec![
+            Value::Integer(1),
+            Value::Tag(1, Box::new(Value::Integer(1705315800))),
+            Value::Tag(
+                999,
+                Box::new(Value::Map(BTreeMap::from([(
+                    Value::Text("k".to_string()),
+                    Value::Bool(true),
+                )]))),
+            ),
+        ]);
+        let bytes = to_vec(&value).unwrap();
+
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_does_not_leak_into_sibling_field() {
+        // A tag stashed while decoding one field must not bleed into an
+        // adjacent field decoded as Value, even though both share the same
+        // decoder session (and thus the same tag side-channel).
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Pair {
+            a: Value,
+            b: Value,
+        }
+
+        let pair = Pair {
+            a: Value::Tag(1, Box::new(Value::Integer(1))),
+            b: Value::Integer(2),
+        };
+        let bytes = to_vec(&pair).unwrap();
+        let decoded: Pair = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, pair);
+    }
+
+    #[test]
+    fn test_value_tag_arbitrary_tag_number() {
+        // Previously, only a whitelisted set of tag numbers (0-87ish) could
+        // be encoded at all; arbitrary tags now work too.
+        let value = Value::Tag(123456, Box::new(Value::Integer(1)));
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
     }
 }

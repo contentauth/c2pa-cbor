@@ -13,7 +13,7 @@
 
 // Portions derived from serde_cbor (https://github.com/pyfisch/cbor)
 
-use std::{fmt, io::Write, marker::PhantomData};
+use std::{cell::Cell, fmt, io::Write, marker::PhantomData};
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -21,6 +21,29 @@ use serde::{
 };
 
 use crate::{Decoder, Encoder, Result, constants::*};
+
+thread_local! {
+    static CURRENT_TAG: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Sentinel newtype-struct name used internally to smuggle a runtime CBOR tag
+/// number (any `u64`) across the generic `Serializer`/`Deserializer`
+/// boundary via [`CURRENT_TAG`], since `serialize_newtype_struct` only
+/// accepts a `&'static str` name and can't carry a dynamic value directly.
+/// Contains an interior NUL byte so it can never collide with a real Rust
+/// type name.
+pub(crate) const TAG_MARKER_NAME: &str = "\0c2pa_cbor_tag\0";
+
+/// Stash a tag number to be picked up by the encoder on the very next
+/// `TAG_MARKER_NAME` newtype-struct call.
+pub(crate) fn set_tag(tag: Option<u64>) {
+    CURRENT_TAG.with(|cell| cell.set(tag));
+}
+
+/// Read and clear the currently stashed tag number, if any.
+pub(crate) fn take_tag() -> Option<u64> {
+    CURRENT_TAG.with(|cell| cell.take())
+}
 
 /// A tagged CBOR value
 #[derive(Debug, Clone, PartialEq)]
@@ -82,8 +105,10 @@ impl<T: for<'de> Deserialize<'de>> Tagged<T> {
     }
 }
 
-// Custom serialization that writes proper CBOR tags
-// The encoder parses strings like "__cbor_tag_N__" and writes CBOR tag N
+// Custom serialization that writes proper CBOR tags for any tag number.
+// `set_tag` stashes the runtime tag number; the encoder's
+// `serialize_newtype_struct` recognizes `TAG_MARKER_NAME`, reads the stashed
+// tag via `take_tag`, and writes the actual CBOR tag before the value.
 impl<T: Serialize> Serialize for Tagged<T> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -91,61 +116,10 @@ impl<T: Serialize> Serialize for Tagged<T> {
     {
         match self.tag {
             Some(tag) => {
-                // Map tag numbers to their corresponding marker strings
-                // The encoder's serialize_newtype_struct parses these and writes the actual CBOR tag
-                let tag_str = match tag {
-                    // Standard RFC 8949 tags
-                    0 => "__cbor_tag_0__",   // Date/time string
-                    1 => "__cbor_tag_1__",   // Epoch datetime
-                    2 => "__cbor_tag_2__",   // Positive bignum
-                    3 => "__cbor_tag_3__",   // Negative bignum
-                    4 => "__cbor_tag_4__",   // Decimal fraction
-                    5 => "__cbor_tag_5__",   // Bigfloat
-                    21 => "__cbor_tag_21__", // Expected conversion to base64url
-                    22 => "__cbor_tag_22__", // Expected conversion to base64
-                    23 => "__cbor_tag_23__", // Expected conversion to base16
-                    24 => "__cbor_tag_24__", // Encoded CBOR data item
-                    32 => "__cbor_tag_32__", // URI
-                    33 => "__cbor_tag_33__", // Base64url
-                    34 => "__cbor_tag_34__", // Base64
-                    36 => "__cbor_tag_36__", // MIME
-
-                    // RFC 8746 - Typed arrays (64-87)
-                    64 => "__cbor_tag_64__", // uint8 array
-                    65 => "__cbor_tag_65__", // uint16 big-endian
-                    66 => "__cbor_tag_66__", // uint32 big-endian
-                    67 => "__cbor_tag_67__", // uint64 big-endian
-                    68 => "__cbor_tag_68__", // uint8 clamped
-                    69 => "__cbor_tag_69__", // uint16 little-endian
-                    70 => "__cbor_tag_70__", // uint32 little-endian
-                    71 => "__cbor_tag_71__", // uint64 little-endian
-                    72 => "__cbor_tag_72__", // sint8
-                    73 => "__cbor_tag_73__", // sint16 big-endian
-                    74 => "__cbor_tag_74__", // sint32 big-endian
-                    75 => "__cbor_tag_75__", // sint64 big-endian
-                    77 => "__cbor_tag_77__", // sint16 little-endian
-                    78 => "__cbor_tag_78__", // sint32 little-endian
-                    79 => "__cbor_tag_79__", // sint64 little-endian
-                    80 => "__cbor_tag_80__", // float16 big-endian
-                    81 => "__cbor_tag_81__", // float32 big-endian
-                    82 => "__cbor_tag_82__", // float64 big-endian
-                    83 => "__cbor_tag_83__", // float128 big-endian
-                    84 => "__cbor_tag_84__", // float16 little-endian
-                    85 => "__cbor_tag_85__", // float32 little-endian
-                    86 => "__cbor_tag_86__", // float64 little-endian
-                    87 => "__cbor_tag_87__", // float128 little-endian
-
-                    _ => {
-                        // Unsupported tag number - use encode_tagged helper functions instead
-                        use serde::ser::Error;
-                        return Err(Error::custom(format!(
-                            "Tag {} not supported via Tagged<T>. Use encode_tagged() helper function for arbitrary tags.",
-                            tag
-                        )));
-                    }
-                };
-
-                serializer.serialize_newtype_struct(tag_str, &self.value)
+                set_tag(Some(tag));
+                let result = serializer.serialize_newtype_struct(TAG_MARKER_NAME, &self.value);
+                set_tag(None);
+                result
             }
             None => {
                 // No tag, just serialize the value directly
@@ -662,6 +636,21 @@ mod tests {
         let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, None);
         assert_eq!(decoded.value, "plain string");
+    }
+
+    #[test]
+    fn test_tagged_serialize_arbitrary_tag_number() {
+        // Regression test for https://github.com/contentauth/c2pa-cbor/issues/27:
+        // Tagged<T> used to support only a hardcoded whitelist of ~30 tag
+        // numbers (erroring on anything else). COSE tags like 17/18/98
+        // weren't on that list; Tagged<T> now supports any u64 tag.
+        let tagged = Tagged::new(Some(18), 1u64); // tag 18: COSE_Sign1
+        let cbor = crate::to_vec(&tagged).unwrap();
+        assert_eq!(cbor, vec![0xd2, 0x01]);
+
+        let decoded = Tagged::<u64>::from_tagged_slice(&cbor).unwrap();
+        assert_eq!(decoded.tag, Some(18));
+        assert_eq!(decoded.value, 1);
     }
 
     #[test]

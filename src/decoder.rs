@@ -390,13 +390,21 @@ impl<R: Read> Decoder<R> {
                 // Store the tag
                 self.current_tag = Some(tag);
 
-                // For maximum compatibility: try visit_map first (for Tagged<T>),
-                // and if that fails, fall back to transparent pass-through (for String, i64, etc.)
-                // We create a special deserializer that tries both approaches
+                // For maximum compatibility, decode the inner value
+                // transparently using the caller's own visitor (so String,
+                // i64, plain structs, etc. work unchanged). The tag is also
+                // stashed via `crate::tags::set_tag` so a tag-aware visitor -
+                // currently just `Value`'s - can reconstruct it without
+                // needing a special decode mode; visitors that never call
+                // `take_tag` simply never notice it was there, and it's
+                // always drained below so it can't leak into an unrelated
+                // later decode.
+                crate::tags::set_tag(Some(tag));
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self, tag },
                     visitor,
                 );
+                crate::tags::set_tag(None);
 
                 // Clear the tag after deserialization
                 self.current_tag = None;
@@ -795,11 +803,17 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 // Store the tag
                 self.de.current_tag = Some(tag);
 
-                // Deserialize the tagged content using TaggedValueDeserializer
+                // Deserialize the tagged content transparently, using the
+                // caller's own visitor. The tag is stashed via
+                // `crate::tags::set_tag` (same mechanism as the main
+                // `deserialize_any_impl` path) so a tag-aware visitor like
+                // `Value`'s can reconstruct it; see the comment there.
+                crate::tags::set_tag(Some(tag));
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self.de, tag },
                     visitor,
                 );
+                crate::tags::set_tag(None);
 
                 // Clear the tag after deserialization
                 self.de.current_tag = None;
