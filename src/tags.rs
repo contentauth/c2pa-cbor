@@ -13,7 +13,7 @@
 
 // Portions derived from serde_cbor (https://github.com/pyfisch/cbor)
 
-use std::{cell::Cell, fmt, io::Write, marker::PhantomData};
+use std::{cell::RefCell, fmt, io::Write, marker::PhantomData};
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -23,47 +23,77 @@ use serde::{
 use crate::{Decoder, Encoder, Result, constants::*};
 
 thread_local! {
-    static CURRENT_TAG: Cell<Option<u64>> = const { Cell::new(None) };
+    // A stack rather than a single slot: CBOR permits a tag to directly wrap
+    // another tag (e.g. `tag(1)(tag(2)(5))`), and decoding that nests two
+    // `TagGuard`s before either tag is consumed by a leaf visitor. A single
+    // slot would let the inner push clobber the outer tag; the stack lets
+    // both survive until `take_all_tags` drains them together, innermost
+    // last-pushed.
+    static TAG_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Sentinel newtype-struct name used internally to smuggle a runtime CBOR tag
 /// number (any `u64`) across the generic `Serializer`/`Deserializer`
-/// boundary via [`CURRENT_TAG`], since `serialize_newtype_struct` only
+/// boundary via [`TAG_STACK`], since `serialize_newtype_struct` only
 /// accepts a `&'static str` name and can't carry a dynamic value directly.
 /// Contains an interior NUL byte so it can never collide with a real Rust
 /// type name.
 pub(crate) const TAG_MARKER_NAME: &str = "\0c2pa_cbor_tag\0";
 
-/// Stash a tag number to be picked up by the encoder on the very next
-/// `TAG_MARKER_NAME` newtype-struct call.
-pub(crate) fn set_tag(tag: Option<u64>) {
-    CURRENT_TAG.with(|cell| cell.set(tag));
-}
-
-/// Read and clear the currently stashed tag number, if any.
+/// Pop the most recently pushed tag, if any. Used by the encoder, which
+/// consumes (and writes) a tag immediately upon seeing the
+/// `TAG_MARKER_NAME` newtype-struct call, before recursing into the wrapped
+/// value - so at most one tag is ever pending at a time on that path, even
+/// for directly-nested tags.
 pub(crate) fn take_tag() -> Option<u64> {
-    CURRENT_TAG.with(|cell| cell.take())
+    TAG_STACK.with(|stack| stack.borrow_mut().pop())
 }
 
-/// RAII guard that stashes a tag number for [`take_tag`] to pick up, and
-/// unconditionally clears it when dropped - including if the code that runs
-/// while it's set panics - so a tag can never leak into an unrelated later
-/// encode/decode on the same thread. `set_tag`/`take_tag` alone only clean
-/// up on the normal-return path; anywhere a tag is stashed before running
-/// arbitrary recursive `Serialize`/`Deserialize` code should use this guard
-/// instead of calling `set_tag` directly.
-pub(crate) struct TagGuard;
+/// Drain every currently pending tag, outermost first. Used by `Value`'s
+/// decode path, where a leaf value may have any number of tags stacked up
+/// directly around it (e.g. `tag(1)(tag(2)(5))` stacks `[1, 2]` by the time
+/// `5` is decoded); the caller should re-wrap the value with each tag in
+/// reverse (innermost/last first) to reconstruct the original nesting.
+pub(crate) fn take_all_tags() -> Vec<u64> {
+    TAG_STACK.with(|stack| std::mem::take(&mut *stack.borrow_mut()))
+}
+
+/// RAII guard that pushes a tag number onto [`TAG_STACK`] for [`take_tag`]/
+/// [`take_all_tags`] to pick up, and unconditionally pops it back off when
+/// dropped - including if the code that runs while it's pushed panics - so a
+/// tag can never leak into an unrelated later encode/decode on the same
+/// thread. Anywhere a tag is stashed before running arbitrary recursive
+/// `Serialize`/`Deserialize` code should use this guard rather than pushing
+/// onto the stack directly.
+///
+/// If the pushed tag was already consumed (by `take_tag`/`take_all_tags`)
+/// before this guard drops - the expected case - dropping is a no-op: the
+/// guard only truncates the stack when it finds its own entry still there,
+/// so it never pops a tag that belongs to an unrelated, still-pending guard
+/// further down the stack.
+pub(crate) struct TagGuard {
+    depth: usize,
+}
 
 impl TagGuard {
     pub(crate) fn new(tag: u64) -> Self {
-        set_tag(Some(tag));
-        TagGuard
+        let depth = TAG_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            stack.push(tag);
+            stack.len()
+        });
+        TagGuard { depth }
     }
 }
 
 impl Drop for TagGuard {
     fn drop(&mut self) {
-        CURRENT_TAG.with(|cell| cell.set(None));
+        TAG_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() >= self.depth {
+                stack.truncate(self.depth - 1);
+            }
+        });
     }
 }
 
