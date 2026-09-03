@@ -82,11 +82,8 @@ impl Serialize for Value {
             Value::Array(a) => a.serialize(serializer),
             Value::Map(m) => m.serialize(serializer),
             Value::Tag(tag, value) => {
-                crate::tags::set_tag(Some(*tag));
-                let result =
-                    serializer.serialize_newtype_struct(crate::tags::TAG_MARKER_NAME, value);
-                crate::tags::set_tag(None);
-                result
+                let _guard = crate::tags::TagGuard::new(*tag);
+                serializer.serialize_newtype_struct(crate::tags::TAG_MARKER_NAME, value)
             }
         }
     }

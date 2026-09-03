@@ -45,6 +45,28 @@ pub(crate) fn take_tag() -> Option<u64> {
     CURRENT_TAG.with(|cell| cell.take())
 }
 
+/// RAII guard that stashes a tag number for [`take_tag`] to pick up, and
+/// unconditionally clears it when dropped - including if the code that runs
+/// while it's set panics - so a tag can never leak into an unrelated later
+/// encode/decode on the same thread. `set_tag`/`take_tag` alone only clean
+/// up on the normal-return path; anywhere a tag is stashed before running
+/// arbitrary recursive `Serialize`/`Deserialize` code should use this guard
+/// instead of calling `set_tag` directly.
+pub(crate) struct TagGuard;
+
+impl TagGuard {
+    pub(crate) fn new(tag: u64) -> Self {
+        set_tag(Some(tag));
+        TagGuard
+    }
+}
+
+impl Drop for TagGuard {
+    fn drop(&mut self) {
+        CURRENT_TAG.with(|cell| cell.set(None));
+    }
+}
+
 /// A tagged CBOR value
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tagged<T> {
@@ -116,10 +138,8 @@ impl<T: Serialize> Serialize for Tagged<T> {
     {
         match self.tag {
             Some(tag) => {
-                set_tag(Some(tag));
-                let result = serializer.serialize_newtype_struct(TAG_MARKER_NAME, &self.value);
-                set_tag(None);
-                result
+                let _guard = TagGuard::new(tag);
+                serializer.serialize_newtype_struct(TAG_MARKER_NAME, &self.value)
             }
             None => {
                 // No tag, just serialize the value directly
@@ -651,6 +671,51 @@ mod tests {
         let decoded = Tagged::<u64>::from_tagged_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, Some(18));
         assert_eq!(decoded.value, 1);
+    }
+
+    #[test]
+    fn test_tag_guard_cleans_up_after_panic() {
+        // Regression test: the tag number is stashed in a thread-local while
+        // a tag is "in flight", so if the recursive serialize/deserialize
+        // call in between panics, a naive set-then-clear pattern would skip
+        // the clear on unwind - leaking the tag into whatever unrelated
+        // encode/decode runs next on the same thread. TagGuard's Drop impl
+        // must clean up even when unwinding.
+        use std::panic;
+
+        struct Panicky;
+
+        impl Serialize for Panicky {
+            fn serialize<S>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                panic!("Panicky::serialize");
+            }
+        }
+
+        impl<'de> Deserialize<'de> for Panicky {
+            fn deserialize<D>(_deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                panic!("Panicky::deserialize");
+            }
+        }
+
+        // Encode: panic while tag 99 is in flight must not leak into the
+        // very next (unrelated, untagged) encode.
+        let tagged = Tagged::new(Some(99), Panicky);
+        assert!(panic::catch_unwind(|| crate::to_vec(&tagged)).is_err());
+        assert_eq!(crate::to_vec(&42u64).unwrap(), vec![0x18, 0x2a]);
+
+        // Decode: panic while tag 99 is in flight must not leak into the
+        // very next (unrelated, untagged) decode.
+        let tagged_bytes = vec![0xd8, 0x63, 0x00]; // tag 99, then unsigned(0)
+        let result = panic::catch_unwind(|| crate::from_slice::<Tagged<Panicky>>(&tagged_bytes));
+        assert!(result.is_err());
+        let decoded: crate::Value = crate::from_slice(&[0x00]).unwrap();
+        assert_eq!(decoded, crate::Value::Integer(0));
     }
 
     #[test]
