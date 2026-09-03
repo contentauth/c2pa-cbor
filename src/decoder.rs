@@ -17,7 +17,7 @@ use std::io::{BufReader, Cursor, Read};
 
 use serde::{Deserialize, de::IntoDeserializer};
 
-use crate::{Error, Result, constants::*};
+use crate::{Error, Result, constants::*, tags};
 
 pub struct Decoder<R: Read> {
     reader: R,
@@ -399,7 +399,7 @@ impl<R: Read> Decoder<R> {
                 // simply never notice it was there, and the guard drains it
                 // on drop (even on panic) so it can't leak into an unrelated
                 // later decode.
-                let _guard = crate::tags::TagGuard::new(tag);
+                let _guard = tags::TagGuard::new(tag);
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self, tag },
                     visitor,
@@ -807,7 +807,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 // (same mechanism as the main `deserialize_any_impl` path)
                 // so a tag-aware visitor like `Value`'s can reconstruct it;
                 // see the comment there.
-                let _guard = crate::tags::TagGuard::new(tag);
+                let _guard = tags::TagGuard::new(tag);
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self.de, tag },
                     visitor,

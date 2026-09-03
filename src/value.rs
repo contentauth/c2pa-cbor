@@ -20,6 +20,8 @@ use serde::{
     de::{self, Visitor},
 };
 
+use crate::tags;
+
 /// Dynamic CBOR value type for working with untyped CBOR data
 ///
 /// This type can represent any CBOR value without knowing its type at compile time.
@@ -82,8 +84,8 @@ impl Serialize for Value {
             Value::Array(a) => a.serialize(serializer),
             Value::Map(m) => m.serialize(serializer),
             Value::Tag(tag, value) => {
-                let _guard = crate::tags::TagGuard::new(*tag);
-                serializer.serialize_newtype_struct(crate::tags::TAG_MARKER_NAME, value)
+                let _guard = tags::TagGuard::new(*tag);
+                serializer.serialize_newtype_struct(tags::TAG_MARKER_NAME, value)
             }
         }
     }
@@ -109,7 +111,7 @@ impl<'de> Deserialize<'de> for Value {
         // re-wrapping in reverse (innermost/last-pushed first) reconstructs
         // `Tag(1, Tag(2, Integer(5)))`.
         fn tagged(value: Value) -> Value {
-            wrap_tags(value, crate::tags::take_all_tags())
+            wrap_tags(value, tags::take_all_tags())
         }
 
         fn wrap_tags(mut value: Value, tags: Vec<u64>) -> Value {
@@ -166,7 +168,7 @@ impl<'de> Deserialize<'de> for Value {
             {
                 // Drain the tags before the fallible check below, so they can
                 // never leak into a later, unrelated decode if this errors.
-                let tags = crate::tags::take_all_tags();
+                let tags = tags::take_all_tags();
                 if value <= i64::MAX as u64 {
                     Ok(wrap_tags(Value::Integer(value as i64), tags))
                 } else {
@@ -214,7 +216,7 @@ impl<'de> Deserialize<'de> for Value {
             {
                 // Take the tags before recursing: decoding the wrapped value
                 // may itself see (and consume) tags of its own.
-                let tags = crate::tags::take_all_tags();
+                let tags = tags::take_all_tags();
                 let inner = Deserialize::deserialize(deserializer)?;
                 Ok(wrap_tags(inner, tags))
             }
@@ -229,7 +231,7 @@ impl<'de> Deserialize<'de> for Value {
             {
                 // Take the tags before iterating: decoding an element may
                 // itself see (and consume) tags of its own.
-                let tags = crate::tags::take_all_tags();
+                let tags = tags::take_all_tags();
                 let mut vec = Vec::new();
                 while let Some(elem) = visitor.next_element()? {
                     vec.push(elem);
@@ -243,7 +245,7 @@ impl<'de> Deserialize<'de> for Value {
             {
                 // Take the tags before iterating: decoding an entry may
                 // itself see (and consume) tags of its own.
-                let tags = crate::tags::take_all_tags();
+                let tags = tags::take_all_tags();
                 let mut map = BTreeMap::new();
                 while let Some((key, value)) = visitor.next_entry()? {
                     map.insert(key, value);
