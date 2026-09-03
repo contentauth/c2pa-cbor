@@ -94,20 +94,29 @@ impl<'de> Deserialize<'de> for Value {
     where
         D: Deserializer<'de>,
     {
-        // Wraps a freshly-constructed leaf `Value` in `Value::Tag` if a CBOR
-        // tag was just read for it. The decoder stashes any tag number via
-        // `crate::tags::set_tag` immediately before dispatching to whichever
+        // Wraps a freshly-constructed leaf `Value` in nested `Value::Tag`s for
+        // every CBOR tag that was just read for it. The decoder pushes each
+        // tag number onto a stack immediately before dispatching to whichever
         // visitor method matches the tagged item's shape (see
-        // `Decoder::deserialize_any_impl`'s `MAJOR_TAG` arm), so draining it
-        // here - as the very first thing each visitor method does - always
-        // captures exactly the tag that applies to this value, never one
-        // belonging to a parent (already consumed further up the call stack)
-        // or a child (not yet read off the wire).
+        // `Decoder::deserialize_any_impl`'s `MAJOR_TAG` arm), so draining the
+        // whole stack here - as the very first thing each visitor method does
+        // - always captures exactly the tags that apply to this value, never
+        // ones belonging to a parent (already consumed further up the call
+        // stack) or a child (not yet read off the wire). A CBOR tag can
+        // directly wrap another tag (e.g. `tag(1)(tag(2)(5))`), which is why
+        // this drains every pending tag rather than just one: by the time `5`
+        // is decoded, both 1 and 2 are pending, outermost pushed first, so
+        // re-wrapping in reverse (innermost/last-pushed first) reconstructs
+        // `Tag(1, Tag(2, Integer(5)))`.
         fn tagged(value: Value) -> Value {
-            match crate::tags::take_tag() {
-                Some(tag) => Value::Tag(tag, Box::new(value)),
-                None => value,
+            wrap_tags(value, crate::tags::take_all_tags())
+        }
+
+        fn wrap_tags(mut value: Value, tags: Vec<u64>) -> Value {
+            for tag in tags.into_iter().rev() {
+                value = Value::Tag(tag, Box::new(value));
             }
+            value
         }
 
         struct ValueVisitor;
@@ -155,14 +164,11 @@ impl<'de> Deserialize<'de> for Value {
             where
                 E: de::Error,
             {
-                // Drain the tag before the fallible check below, so it can
+                // Drain the tags before the fallible check below, so they can
                 // never leak into a later, unrelated decode if this errors.
-                let tag = crate::tags::take_tag();
+                let tags = crate::tags::take_all_tags();
                 if value <= i64::MAX as u64 {
-                    Ok(match tag {
-                        Some(tag) => Value::Tag(tag, Box::new(Value::Integer(value as i64))),
-                        None => Value::Integer(value as i64),
-                    })
+                    Ok(wrap_tags(Value::Integer(value as i64), tags))
                 } else {
                     Err(E::custom(format!("u64 value {} too large for i64", value)))
                 }
@@ -206,14 +212,11 @@ impl<'de> Deserialize<'de> for Value {
             where
                 D: Deserializer<'de>,
             {
-                // Take the tag before recursing: decoding the wrapped value
-                // may itself see (and consume) a tag of its own.
-                let tag = crate::tags::take_tag();
+                // Take the tags before recursing: decoding the wrapped value
+                // may itself see (and consume) tags of its own.
+                let tags = crate::tags::take_all_tags();
                 let inner = Deserialize::deserialize(deserializer)?;
-                Ok(match tag {
-                    Some(tag) => Value::Tag(tag, Box::new(inner)),
-                    None => inner,
-                })
+                Ok(wrap_tags(inner, tags))
             }
 
             fn visit_unit<E>(self) -> Result<Value, E> {
@@ -224,36 +227,28 @@ impl<'de> Deserialize<'de> for Value {
             where
                 V: de::SeqAccess<'de>,
             {
-                // Take the tag before iterating: decoding an element may
-                // itself see (and consume) a tag of its own.
-                let tag = crate::tags::take_tag();
+                // Take the tags before iterating: decoding an element may
+                // itself see (and consume) tags of its own.
+                let tags = crate::tags::take_all_tags();
                 let mut vec = Vec::new();
                 while let Some(elem) = visitor.next_element()? {
                     vec.push(elem);
                 }
-                let value = Value::Array(vec);
-                Ok(match tag {
-                    Some(tag) => Value::Tag(tag, Box::new(value)),
-                    None => value,
-                })
+                Ok(wrap_tags(Value::Array(vec), tags))
             }
 
             fn visit_map<V>(self, mut visitor: V) -> Result<Value, V::Error>
             where
                 V: de::MapAccess<'de>,
             {
-                // Take the tag before iterating: decoding an entry may
-                // itself see (and consume) a tag of its own.
-                let tag = crate::tags::take_tag();
+                // Take the tags before iterating: decoding an entry may
+                // itself see (and consume) tags of its own.
+                let tags = crate::tags::take_all_tags();
                 let mut map = BTreeMap::new();
                 while let Some((key, value)) = visitor.next_entry()? {
                     map.insert(key, value);
                 }
-                let value = Value::Map(map);
-                Ok(match tag {
-                    Some(tag) => Value::Tag(tag, Box::new(value)),
-                    None => value,
-                })
+                Ok(wrap_tags(Value::Map(map), tags))
             }
         }
 
@@ -1353,6 +1348,52 @@ mod tests {
         // Previously, only a whitelisted set of tag numbers (0-87ish) could
         // be encoded at all; arbitrary tags now work too.
         let value = Value::Tag(123456, Box::new(Value::Integer(1)));
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_directly_wrapping_tag_round_trips() {
+        // Regression test: a CBOR tag can directly wrap another tag (no
+        // array/map/option in between), e.g. `tag(1)(tag(2)(5))`. The first
+        // cut of tag support only drained one pending tag per decoded value,
+        // so the inner tag's `TagGuard` clobbered the outer tag on the
+        // thread-local stack before anything ever consumed it, silently
+        // dropping it.
+        let value = Value::Tag(1, Box::new(Value::Tag(2, Box::new(Value::Integer(5)))));
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(bytes, vec![0xc1, 0xc2, 0x05]);
+
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_triple_nested_round_trips() {
+        let value = Value::Tag(
+            1,
+            Box::new(Value::Tag(
+                2,
+                Box::new(Value::Tag(3, Box::new(Value::Text("x".to_string())))),
+            )),
+        );
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_wrapping_tagged_array_round_trips() {
+        // A tag directly wraps another tag, which itself wraps an array -
+        // exercises the wrap_tags fold inside visit_seq.
+        let value = Value::Tag(
+            1,
+            Box::new(Value::Tag(
+                2,
+                Box::new(Value::Array(vec![Value::Integer(1), Value::Integer(2)])),
+            )),
+        );
         let bytes = to_vec(&value).unwrap();
         let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(decoded, value);
