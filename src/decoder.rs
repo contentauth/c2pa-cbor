@@ -416,10 +416,16 @@ impl<R: Read> Decoder<R> {
                 // on drop (even on panic) so it can't leak into an unrelated
                 // later decode.
                 let _guard = tags::TagGuard::new(tag);
+                // A chain of nested tags (e.g. repeated 0xc0 bytes) recurses
+                // here just like nested arrays/maps do, so it needs the same
+                // depth guard to bound stack usage against malicious input.
+                self.check_recursion_depth()?;
+                self.recursion_depth += 1;
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self, tag },
                     visitor,
                 );
+                // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
 
                 // Clear the tag after deserialization
                 self.current_tag = None;
@@ -575,7 +581,10 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                 .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
 
             self.current_tag = Some(tag);
+            self.check_recursion_depth()?;
+            self.recursion_depth += 1;
             let result = TaggedValueDeserializer { de: &mut self, tag }.deserialize_map(visitor);
+            // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
             self.current_tag = None;
             result
         } else {
@@ -681,7 +690,10 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                 .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
 
             self.current_tag = Some(tag);
+            self.check_recursion_depth()?;
+            self.recursion_depth += 1;
             let result = TaggedValueDeserializer { de: self, tag }.deserialize_map(visitor);
+            // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
             self.current_tag = None;
             result
         } else {
@@ -824,10 +836,13 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 // so a tag-aware visitor like `Value`'s can reconstruct it;
                 // see the comment there.
                 let _guard = tags::TagGuard::new(tag);
+                self.de.check_recursion_depth()?;
+                self.de.recursion_depth += 1;
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self.de, tag },
                     visitor,
                 );
+                // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
 
                 // Clear the tag after deserialization
                 self.de.current_tag = None;
@@ -1044,6 +1059,16 @@ impl<'de, 'a, R: Read> serde::de::MapAccess<'de> for MapAccess<'a, R> {
 struct TaggedValueDeserializer<'a, R: Read> {
     de: &'a mut Decoder<R>,
     tag: u64,
+}
+
+// Every construction site increments `recursion_depth` (after checking the
+// limit) right before building one of these; this pairs it with a decrement
+// so a chain of nested tags is bounded the same way nested arrays/maps are,
+// instead of recursing without limit.
+impl<'a, R: Read> Drop for TaggedValueDeserializer<'a, R> {
+    fn drop(&mut self) {
+        self.de.recursion_depth = self.de.recursion_depth.saturating_sub(1);
+    }
 }
 
 impl<'de, 'a, R: Read> serde::Deserializer<'de> for TaggedValueDeserializer<'a, R> {

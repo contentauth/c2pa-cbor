@@ -1711,6 +1711,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_tag_chain_recursion_depth_limit() {
+        use std::io::Cursor;
+
+        use crate::decoder::Decoder;
+
+        // A chain of nested tags (e.g. repeated 0xc0 bytes) recurses through
+        // the same MAJOR_TAG decoding path on each tag, just like nested
+        // arrays/maps recurse on each level - it must be bounded by the same
+        // recursion-depth guard, or a long enough chain would overflow the
+        // stack instead of returning a decode error.
+        let mut cbor = vec![0xc0; 150]; // 150 nested tag(0, ...) wrappers (exceeds DEFAULT_MAX_DEPTH of 128)
+        cbor.push(0x00); // innermost value: integer 0
+
+        let mut decoder = Decoder::new(Cursor::new(&cbor[..]));
+        let result: Result<Value> = decoder.decode();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("nesting depth") || err_msg.contains("recursion"),
+            "Expected recursion depth error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
     fn test_decode_allocation_limit() {
         // Create CBOR for a byte string claiming to be 200MB (exceeds default 100MB limit)
         let mut cbor = vec![0x5a]; // byte string with u32 length
