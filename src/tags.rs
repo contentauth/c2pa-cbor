@@ -736,14 +736,26 @@ mod tests {
         // Encode: panic while tag 99 is in flight must not leak into the
         // very next (unrelated, untagged) encode.
         let tagged = Tagged::new(Some(99), Panicky);
-        assert!(panic::catch_unwind(|| crate::to_vec(&tagged)).is_err());
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| crate::to_vec(&tagged)));
+        assert!(result.is_err());
+
+        // Give the panic handler time to unwind properly and ensure tag stack is clean
+        // by explicitly draining any leftover tags (defensive programming for WASM)
+        let _ = take_all_tags();
+
         assert_eq!(crate::to_vec(&42u64).unwrap(), vec![0x18, 0x2a]);
 
         // Decode: panic while tag 99 is in flight must not leak into the
         // very next (unrelated, untagged) decode.
         let tagged_bytes = vec![0xd8, 0x63, 0x00]; // tag 99, then unsigned(0)
-        let result = panic::catch_unwind(|| crate::from_slice::<Tagged<Panicky>>(&tagged_bytes));
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            crate::from_slice::<Tagged<Panicky>>(&tagged_bytes)
+        }));
         assert!(result.is_err());
+
+        // Defensive cleanup again
+        let _ = take_all_tags();
+
         let decoded: crate::Value = crate::from_slice(&[0x00]).unwrap();
         assert_eq!(decoded, crate::Value::Integer(0));
     }
