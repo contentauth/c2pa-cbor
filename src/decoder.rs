@@ -17,7 +17,7 @@ use std::io::{BufReader, Cursor, Read};
 
 use serde::{Deserialize, de::IntoDeserializer};
 
-use crate::{Error, Result, constants::*};
+use crate::{Error, Result, constants::*, tags};
 
 pub struct Decoder<R: Read> {
     reader: R,
@@ -390,9 +390,16 @@ impl<R: Read> Decoder<R> {
                 // Store the tag
                 self.current_tag = Some(tag);
 
-                // For maximum compatibility: try visit_map first (for Tagged<T>),
-                // and if that fails, fall back to transparent pass-through (for String, i64, etc.)
-                // We create a special deserializer that tries both approaches
+                // For maximum compatibility, decode the inner value
+                // transparently using the caller's own visitor (so String,
+                // i64, plain structs, etc. work unchanged). The tag is also
+                // stashed via a `TagGuard` so a tag-aware visitor - currently
+                // just `Value`'s - can reconstruct it without needing a
+                // special decode mode; visitors that never call `take_tag`
+                // simply never notice it was there, and the guard drains it
+                // on drop (even on panic) so it can't leak into an unrelated
+                // later decode.
+                let _guard = tags::TagGuard::new(tag);
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self, tag },
                     visitor,
@@ -795,7 +802,12 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 // Store the tag
                 self.de.current_tag = Some(tag);
 
-                // Deserialize the tagged content using TaggedValueDeserializer
+                // Deserialize the tagged content transparently, using the
+                // caller's own visitor. The tag is stashed via a `TagGuard`
+                // (same mechanism as the main `deserialize_any_impl` path)
+                // so a tag-aware visitor like `Value`'s can reconstruct it;
+                // see the comment there.
+                let _guard = tags::TagGuard::new(tag);
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self.de, tag },
                     visitor,

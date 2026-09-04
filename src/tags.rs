@@ -13,7 +13,7 @@
 
 // Portions derived from serde_cbor (https://github.com/pyfisch/cbor)
 
-use std::{fmt, io::Write, marker::PhantomData};
+use std::{cell::RefCell, fmt, io::Write, marker::PhantomData};
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -21,6 +21,81 @@ use serde::{
 };
 
 use crate::{Decoder, Encoder, Result, constants::*};
+
+thread_local! {
+    // A stack rather than a single slot: CBOR permits a tag to directly wrap
+    // another tag (e.g. `tag(1)(tag(2)(5))`), and decoding that nests two
+    // `TagGuard`s before either tag is consumed by a leaf visitor. A single
+    // slot would let the inner push clobber the outer tag; the stack lets
+    // both survive until `take_all_tags` drains them together, innermost
+    // last-pushed.
+    static TAG_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sentinel newtype-struct name used internally to smuggle a runtime CBOR tag
+/// number (any `u64`) across the generic `Serializer`/`Deserializer`
+/// boundary via [`TAG_STACK`], since `serialize_newtype_struct` only
+/// accepts a `&'static str` name and can't carry a dynamic value directly.
+/// Contains an interior NUL byte so it can never collide with a real Rust
+/// type name.
+pub(crate) const TAG_MARKER_NAME: &str = "\0c2pa_cbor_tag\0";
+
+/// Pop the most recently pushed tag, if any. Used by the encoder, which
+/// consumes (and writes) a tag immediately upon seeing the
+/// `TAG_MARKER_NAME` newtype-struct call, before recursing into the wrapped
+/// value - so at most one tag is ever pending at a time on that path, even
+/// for directly-nested tags.
+pub(crate) fn take_tag() -> Option<u64> {
+    TAG_STACK.with(|stack| stack.borrow_mut().pop())
+}
+
+/// Drain every currently pending tag, outermost first. Used by `Value`'s
+/// decode path, where a leaf value may have any number of tags stacked up
+/// directly around it (e.g. `tag(1)(tag(2)(5))` stacks `[1, 2]` by the time
+/// `5` is decoded); the caller should re-wrap the value with each tag in
+/// reverse (innermost/last first) to reconstruct the original nesting.
+pub(crate) fn take_all_tags() -> Vec<u64> {
+    TAG_STACK.with(|stack| std::mem::take(&mut *stack.borrow_mut()))
+}
+
+/// RAII guard that pushes a tag number onto [`TAG_STACK`] for [`take_tag`]/
+/// [`take_all_tags`] to pick up, and unconditionally pops it back off when
+/// dropped - including if the code that runs while it's pushed panics - so a
+/// tag can never leak into an unrelated later encode/decode on the same
+/// thread. Anywhere a tag is stashed before running arbitrary recursive
+/// `Serialize`/`Deserialize` code should use this guard rather than pushing
+/// onto the stack directly.
+///
+/// If the pushed tag was already consumed (by `take_tag`/`take_all_tags`)
+/// before this guard drops - the expected case - dropping is a no-op: the
+/// guard only truncates the stack when it finds its own entry still there,
+/// so it never pops a tag that belongs to an unrelated, still-pending guard
+/// further down the stack.
+pub(crate) struct TagGuard {
+    depth: usize,
+}
+
+impl TagGuard {
+    pub(crate) fn new(tag: u64) -> Self {
+        let depth = TAG_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            stack.push(tag);
+            stack.len()
+        });
+        TagGuard { depth }
+    }
+}
+
+impl Drop for TagGuard {
+    fn drop(&mut self) {
+        TAG_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() >= self.depth {
+                stack.truncate(self.depth - 1);
+            }
+        });
+    }
+}
 
 /// A tagged CBOR value
 #[derive(Debug, Clone, PartialEq)]
@@ -82,8 +157,10 @@ impl<T: for<'de> Deserialize<'de>> Tagged<T> {
     }
 }
 
-// Custom serialization that writes proper CBOR tags
-// The encoder parses strings like "__cbor_tag_N__" and writes CBOR tag N
+// Custom serialization that writes proper CBOR tags for any tag number.
+// `set_tag` stashes the runtime tag number; the encoder's
+// `serialize_newtype_struct` recognizes `TAG_MARKER_NAME`, reads the stashed
+// tag via `take_tag`, and writes the actual CBOR tag before the value.
 impl<T: Serialize> Serialize for Tagged<T> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -91,61 +168,8 @@ impl<T: Serialize> Serialize for Tagged<T> {
     {
         match self.tag {
             Some(tag) => {
-                // Map tag numbers to their corresponding marker strings
-                // The encoder's serialize_newtype_struct parses these and writes the actual CBOR tag
-                let tag_str = match tag {
-                    // Standard RFC 8949 tags
-                    0 => "__cbor_tag_0__",   // Date/time string
-                    1 => "__cbor_tag_1__",   // Epoch datetime
-                    2 => "__cbor_tag_2__",   // Positive bignum
-                    3 => "__cbor_tag_3__",   // Negative bignum
-                    4 => "__cbor_tag_4__",   // Decimal fraction
-                    5 => "__cbor_tag_5__",   // Bigfloat
-                    21 => "__cbor_tag_21__", // Expected conversion to base64url
-                    22 => "__cbor_tag_22__", // Expected conversion to base64
-                    23 => "__cbor_tag_23__", // Expected conversion to base16
-                    24 => "__cbor_tag_24__", // Encoded CBOR data item
-                    32 => "__cbor_tag_32__", // URI
-                    33 => "__cbor_tag_33__", // Base64url
-                    34 => "__cbor_tag_34__", // Base64
-                    36 => "__cbor_tag_36__", // MIME
-
-                    // RFC 8746 - Typed arrays (64-87)
-                    64 => "__cbor_tag_64__", // uint8 array
-                    65 => "__cbor_tag_65__", // uint16 big-endian
-                    66 => "__cbor_tag_66__", // uint32 big-endian
-                    67 => "__cbor_tag_67__", // uint64 big-endian
-                    68 => "__cbor_tag_68__", // uint8 clamped
-                    69 => "__cbor_tag_69__", // uint16 little-endian
-                    70 => "__cbor_tag_70__", // uint32 little-endian
-                    71 => "__cbor_tag_71__", // uint64 little-endian
-                    72 => "__cbor_tag_72__", // sint8
-                    73 => "__cbor_tag_73__", // sint16 big-endian
-                    74 => "__cbor_tag_74__", // sint32 big-endian
-                    75 => "__cbor_tag_75__", // sint64 big-endian
-                    77 => "__cbor_tag_77__", // sint16 little-endian
-                    78 => "__cbor_tag_78__", // sint32 little-endian
-                    79 => "__cbor_tag_79__", // sint64 little-endian
-                    80 => "__cbor_tag_80__", // float16 big-endian
-                    81 => "__cbor_tag_81__", // float32 big-endian
-                    82 => "__cbor_tag_82__", // float64 big-endian
-                    83 => "__cbor_tag_83__", // float128 big-endian
-                    84 => "__cbor_tag_84__", // float16 little-endian
-                    85 => "__cbor_tag_85__", // float32 little-endian
-                    86 => "__cbor_tag_86__", // float64 little-endian
-                    87 => "__cbor_tag_87__", // float128 little-endian
-
-                    _ => {
-                        // Unsupported tag number - use encode_tagged helper functions instead
-                        use serde::ser::Error;
-                        return Err(Error::custom(format!(
-                            "Tag {} not supported via Tagged<T>. Use encode_tagged() helper function for arbitrary tags.",
-                            tag
-                        )));
-                    }
-                };
-
-                serializer.serialize_newtype_struct(tag_str, &self.value)
+                let _guard = TagGuard::new(tag);
+                serializer.serialize_newtype_struct(TAG_MARKER_NAME, &self.value)
             }
             None => {
                 // No tag, just serialize the value directly
@@ -662,6 +686,69 @@ mod tests {
         let decoded: Tagged<String> = crate::from_slice(&cbor).unwrap();
         assert_eq!(decoded.tag, None);
         assert_eq!(decoded.value, "plain string");
+    }
+
+    #[test]
+    fn test_tagged_serialize_arbitrary_tag_number() {
+        // Regression test for https://github.com/contentauth/c2pa-cbor/issues/27:
+        // Tagged<T> used to support only a hardcoded whitelist of ~30 tag
+        // numbers (erroring on anything else). COSE tags like 17/18/98
+        // weren't on that list; Tagged<T> now supports any u64 tag.
+        let tagged = Tagged::new(Some(18), 1u64); // tag 18: COSE_Sign1
+        let cbor = crate::to_vec(&tagged).unwrap();
+        assert_eq!(cbor, vec![0xd2, 0x01]);
+
+        let decoded = Tagged::<u64>::from_tagged_slice(&cbor).unwrap();
+        assert_eq!(decoded.tag, Some(18));
+        assert_eq!(decoded.value, 1);
+    }
+
+    #[test]
+    fn test_tag_guard_cleans_up_after_panic() {
+        // Regression test: the tag number is stashed in a thread-local while
+        // a tag is "in flight", so if the recursive serialize/deserialize
+        // call in between panics, a naive set-then-clear pattern would skip
+        // the clear on unwind - leaking the tag into whatever unrelated
+        // encode/decode runs next on the same thread. TagGuard's Drop impl
+        // must clean up even when unwinding.
+
+        // Verify that TagGuard properly cleans up its entry from the stack
+        // even when dropped early (simulating panic cleanup behavior).
+
+        // Initially, tag stack should be empty
+        assert_eq!(take_all_tags(), Vec::<u64>::new());
+
+        // Push a tag via TagGuard
+        {
+            let _guard = TagGuard::new(99);
+            // While guard is in scope, tag should be on stack
+            let tags = TAG_STACK.with(|stack| stack.borrow().len());
+            assert_eq!(tags, 1);
+        } // Guard drops here
+
+        // After guard is dropped, stack should be clean
+        assert_eq!(take_all_tags(), Vec::<u64>::new());
+
+        // Test nested guards (simulating nested tags)
+        {
+            let _guard1 = TagGuard::new(99);
+            {
+                let _guard2 = TagGuard::new(100);
+                let tags = TAG_STACK.with(|stack| stack.borrow().len());
+                assert_eq!(tags, 2);
+            } // Inner guard drops
+
+            let tags = TAG_STACK.with(|stack| stack.borrow().len());
+            assert_eq!(tags, 1); // Only outer guard remains
+        } // Outer guard drops
+
+        assert_eq!(take_all_tags(), Vec::<u64>::new());
+
+        // Verify that unrelated encode/decode operations work correctly
+        // after tag guard cleanup
+        assert_eq!(crate::to_vec(&42u64).unwrap(), vec![0x18, 0x2a]);
+        let decoded: crate::Value = crate::from_slice(&[0x00]).unwrap();
+        assert_eq!(decoded, crate::Value::Integer(0));
     }
 
     #[test]
