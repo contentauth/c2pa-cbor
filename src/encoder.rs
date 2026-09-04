@@ -461,7 +461,7 @@ impl<'a, W: Write> serde::ser::SerializeStructVariant for SerializeStructVariant
         if encoder.deterministic {
             buffer.sort_by(|a, b| a.0.cmp(&b.0));
             if buffer.windows(2).any(|w| w[0].0 == w[1].0) {
-                return Err(Error::Message(
+                return Err(Error::Encoding(
                     "duplicate map key in deterministic CBOR encoding".to_string(),
                 ));
             }
@@ -609,7 +609,7 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
                 )?);
                 Ok(())
             }
-            SerializeVec::Map { .. } => Err(Error::Message(
+            SerializeVec::Map { .. } => Err(Error::Encoding(
                 "serialize_element called on map serializer".to_string(),
             )),
         }
@@ -628,7 +628,7 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
                 Ok(())
             }
             SerializeVec::Map { .. } => {
-                Err(Error::Message("end called on map serializer".to_string()))
+                Err(Error::Encoding("end called on map serializer".to_string()))
             }
         }
     }
@@ -682,7 +682,7 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 )?);
                 Ok(())
             }
-            SerializeVec::Array { .. } => Err(Error::Message(
+            SerializeVec::Array { .. } => Err(Error::Encoding(
                 "serialize_key called on array serializer".to_string(),
             )),
         }
@@ -708,12 +708,12 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                     buffer.push((key_bytes, value_bytes));
                     Ok(())
                 } else {
-                    Err(Error::Message(
+                    Err(Error::Encoding(
                         "serialize_value called without serialize_key".to_string(),
                     ))
                 }
             }
-            SerializeVec::Array { .. } => Err(Error::Message(
+            SerializeVec::Array { .. } => Err(Error::Encoding(
                 "serialize_value called on array serializer".to_string(),
             )),
         }
@@ -728,7 +728,7 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 pending_key,
             } => {
                 if pending_key.is_some() {
-                    return Err(Error::Message(
+                    return Err(Error::Encoding(
                         "serialize_key called without serialize_value".to_string(),
                     ));
                 }
@@ -741,7 +741,7 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 if encoder.deterministic {
                     buffer.sort_by(|a, b| a.0.cmp(&b.0));
                     if buffer.windows(2).any(|w| w[0].0 == w[1].0) {
-                        return Err(Error::Message(
+                        return Err(Error::Encoding(
                             "duplicate map key in deterministic CBOR encoding".to_string(),
                         ));
                     }
@@ -755,9 +755,9 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 }
                 Ok(())
             }
-            SerializeVec::Array { .. } => {
-                Err(Error::Message("end called on array serializer".to_string()))
-            }
+            SerializeVec::Array { .. } => Err(Error::Encoding(
+                "end called on array serializer".to_string(),
+            )),
         }
     }
 }
@@ -781,22 +781,10 @@ impl<'a, W: Write> serde::ser::SerializeStruct for SerializeVec<'a, W> {
 
 // Convenience functions
 fn to_vec_with<T: Serialize>(value: &T, deterministic: bool) -> Result<Vec<u8>> {
-    // Try direct serialization first
     let mut buf = Vec::new();
     let mut encoder = Encoder::new(&mut buf).set_deterministic(deterministic);
-    match encoder.encode(value) {
-        Ok(()) => Ok(buf),
-        Err(Error::Message(ref msg)) if msg.contains("indefinite-length") => {
-            // Fall back to value-based serialization for types that need indefinite length
-            // This handles #[serde(flatten)] and other cases where size is unknown
-            let value = crate::value::to_value(value)?;
-            buf.clear();
-            let mut encoder = Encoder::new(&mut buf).set_deterministic(deterministic);
-            encoder.encode(&value)?;
-            Ok(buf)
-        }
-        Err(e) => Err(e),
-    }
+    encoder.encode(value)?;
+    Ok(buf)
 }
 
 /// Serializes a value to a CBOR byte vector, preserving declaration/insertion

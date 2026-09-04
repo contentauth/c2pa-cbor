@@ -553,7 +553,7 @@ impl Serializer for ValueSerializer {
         if v <= i64::MAX as u64 {
             Ok(Value::Integer(v as i64))
         } else {
-            Err(crate::Error::Message(format!(
+            Err(crate::Error::Encoding(format!(
                 "u64 value {} too large for i64",
                 v
             )))
@@ -767,7 +767,7 @@ impl serde::ser::SerializeMap for SerializeMap {
 
     fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
         let key = self.next_key.take().ok_or_else(|| {
-            crate::Error::Message("serialize_value called before serialize_key".to_string())
+            crate::Error::Encoding("serialize_value called before serialize_key".to_string())
         })?;
         self.map.insert(key, value.serialize(ValueSerializer)?);
         Ok(())
