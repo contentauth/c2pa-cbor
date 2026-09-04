@@ -29,6 +29,12 @@ pub struct Encoder<W: Write> {
     /// value, with NaNs canonicalized per §4.2.2. Defaults to false,
     /// preserving the original unsorted, unbuffered, full-width fast path.
     deterministic: bool,
+    /// When true, floats are written in the shortest width (f16/f32/f64)
+    /// that preserves their value, without requiring full deterministic
+    /// mode. Deterministic mode already implies this. Defaults to false,
+    /// preserving the original width of the input for maximum compatibility
+    /// with decoders that don't expect shortened floats.
+    compact_floats: bool,
 }
 
 impl<W: Write> Encoder<W> {
@@ -36,6 +42,7 @@ impl<W: Write> Encoder<W> {
         Encoder {
             writer,
             deterministic: false,
+            compact_floats: false,
         }
     }
 
@@ -52,6 +59,20 @@ impl<W: Write> Encoder<W> {
     /// round-tripping through this crate.
     pub fn set_deterministic(mut self, deterministic: bool) -> Self {
         self.deterministic = deterministic;
+        self
+    }
+
+    /// Write floats in the shortest width (f16/f32/f64) that preserves
+    /// their value, on the fast non-deterministic path too. [`Self::set_deterministic`]
+    /// already implies this; use this separately when shortest-form floats
+    /// are wanted without the sorted-key buffering that deterministic mode
+    /// also requires.
+    ///
+    /// Matches RFC 8949's preferred serialization for floats, but may not
+    /// round-trip identically through decoders that don't expect shortened
+    /// floats.
+    pub fn set_compact_floats(mut self, compact_floats: bool) -> Self {
+        self.compact_floats = compact_floats;
         self
     }
 
@@ -224,7 +245,7 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_f32(self, v: f32) -> Result<()> {
-        if self.deterministic || cfg!(feature = "compact_floats") {
+        if self.deterministic || self.compact_floats {
             return self.write_compact_float(v as f64);
         }
 
@@ -235,7 +256,7 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     }
 
     fn serialize_f64(self, v: f64) -> Result<()> {
-        if self.deterministic || cfg!(feature = "compact_floats") {
+        if self.deterministic || self.compact_floats {
             return self.write_compact_float(v);
         }
 
@@ -423,8 +444,11 @@ impl<'a, W: Write> serde::ser::SerializeStructVariant for SerializeStructVariant
         value: &T,
     ) -> Result<()> {
         let deterministic = self.encoder.deterministic;
-        let key_bytes = SerializeVec::<W>::serialize_to_buffer(&key, deterministic)?;
-        let value_bytes = SerializeVec::<W>::serialize_to_buffer(value, deterministic)?;
+        let compact_floats = self.encoder.compact_floats;
+        let key_bytes =
+            SerializeVec::<W>::serialize_to_buffer(&key, deterministic, compact_floats)?;
+        let value_bytes =
+            SerializeVec::<W>::serialize_to_buffer(value, deterministic, compact_floats)?;
         self.buffer.push((key_bytes, value_bytes));
         Ok(())
     }
@@ -542,13 +566,20 @@ impl<W: Write> serde::ser::SerializeStruct for &mut Encoder<W> {
 
 impl<'a, W: Write> SerializeVec<'a, W> {
     /// Serialize a value to a buffer for later writing, inheriting the
-    /// outer encoder's determinism setting for any nested maps/structs
-    fn serialize_to_buffer<T>(value: &T, deterministic: bool) -> Result<Vec<u8>>
+    /// outer encoder's determinism and float-width settings for any nested
+    /// maps/structs
+    fn serialize_to_buffer<T>(
+        value: &T,
+        deterministic: bool,
+        compact_floats: bool,
+    ) -> Result<Vec<u8>>
     where
         T: ?Sized + Serialize,
     {
         let mut buf = Vec::new();
-        let mut encoder = Encoder::new(&mut buf).set_deterministic(deterministic);
+        let mut encoder = Encoder::new(&mut buf)
+            .set_deterministic(deterministic)
+            .set_compact_floats(compact_floats);
         value.serialize(&mut encoder)?;
         Ok(buf)
     }
@@ -571,7 +602,11 @@ impl<'a, W: Write> serde::ser::SerializeSeq for SerializeVec<'a, W> {
         match self {
             SerializeVec::Direct { encoder } => value.serialize(&mut **encoder),
             SerializeVec::Array { encoder, buffer } => {
-                buffer.push(Self::serialize_to_buffer(value, encoder.deterministic)?);
+                buffer.push(Self::serialize_to_buffer(
+                    value,
+                    encoder.deterministic,
+                    encoder.compact_floats,
+                )?);
                 Ok(())
             }
             SerializeVec::Map { .. } => Err(Error::Message(
@@ -640,7 +675,11 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 encoder,
                 ..
             } => {
-                *pending_key = Some(Self::serialize_to_buffer(key, encoder.deterministic)?);
+                *pending_key = Some(Self::serialize_to_buffer(
+                    key,
+                    encoder.deterministic,
+                    encoder.compact_floats,
+                )?);
                 Ok(())
             }
             SerializeVec::Array { .. } => Err(Error::Message(
@@ -660,7 +699,11 @@ impl<'a, W: Write> serde::ser::SerializeMap for SerializeVec<'a, W> {
                 pending_key,
                 encoder,
             } => {
-                let value_bytes = Self::serialize_to_buffer(value, encoder.deterministic)?;
+                let value_bytes = Self::serialize_to_buffer(
+                    value,
+                    encoder.deterministic,
+                    encoder.compact_floats,
+                )?;
                 if let Some(key_bytes) = pending_key.take() {
                     buffer.push((key_bytes, value_bytes));
                     Ok(())

@@ -47,14 +47,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"  # For efficient byte array handling
 ```
 
-### Optional Features
+### Compact Float Encoding
 
-- **`compact_floats`**: Enable optimal float encoding (f16/f32/f64 based on precision needed) on the fast, non-deterministic path too
-  - By default, `to_vec`/`to_writer` encode floats at their original width (f32 stays 4 bytes, f64 stays 8 bytes) for maximum compatibility
-  - [Deterministic mode](#deterministic-encoding) (`to_vec_deterministic` etc.) always uses shortest-form float encoding, with or without this feature, since RFC 8949 §4.2.1 requires it
-  - This feature extends the same shortest-form encoding to the non-deterministic path, so values like `0.0` or `2.5` encode as f16 (2 bytes) when lossless even without sorting keys
-  - Matches RFC 8949 preferred encoding but may not work with older CBOR decoders
-  - Enable with: `c2pa_cbor = { version = "0.1", features = ["compact_floats"] }`
+By default, `to_vec`/`to_writer` encode floats at their original width (f32 stays 4 bytes, f64 stays 8 bytes) for maximum compatibility. [Deterministic mode](#deterministic-encoding) (`to_vec_deterministic` etc.) always uses shortest-form float encoding, since RFC 8949 §4.2.1 requires it.
+
+To get the same shortest-form encoding on the non-deterministic path, without opting into deterministic mode's sorted-key buffering, use `Encoder::new(writer).set_compact_floats(true)`. Values like `0.0` or `2.5` then encode as f16 (2 bytes) when lossless. This matches RFC 8949 preferred encoding but may not work with older CBOR decoders.
 
 ## Quick Start
 
@@ -305,7 +302,7 @@ This library **always produces definite-length CBOR** (never indefinite-length),
 
 Definite-length output alone isn't enough to make CBOR byte-for-byte reproducible: map and struct key order still depends on source order (struct field declaration order, `HashMap` iteration order, etc.), and floats can be encoded at more than one width. For that, use **deterministic mode**, which implements RFC 8949 §4.2.1's Core Deterministic Encoding Requirement in full:
 - Map and struct entries are buffered and sorted by the bytewise-lexicographic order of their encoded key bytes, and duplicate keys are rejected
-- Floats are encoded in the shortest width (f16/f32/f64) that preserves their value, regardless of whether the `compact_floats` feature is enabled
+- Floats are encoded in the shortest width (f16/f32/f64) that preserves their value, without needing [`compact_floats`](#compact-float-encoding) separately enabled
 - NaN values are canonicalized to the single half-precision NaN encoding (`0xf97e00`), per RFC 8949 §4.2.2, instead of preserving the input's sign/payload bits
 
 C2PA manifests require this.

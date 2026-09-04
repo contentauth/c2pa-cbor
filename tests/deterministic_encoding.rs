@@ -188,11 +188,11 @@ fn duplicate_keys_are_allowed_by_default() {
 }
 
 #[test]
-fn deterministic_mode_uses_preferred_float_encoding_without_compact_floats_feature() {
+fn deterministic_mode_uses_preferred_float_encoding_independent_of_compact_floats() {
     // RFC 8949 §4.2.1's "Core Deterministic Encoding Requirements" bundles
     // preferred serialization (shortest-form floats) together with sorted
-    // map keys. Deterministic mode must apply both, regardless of whether
-    // the crate was built with the separate `compact_floats` feature.
+    // map keys. Deterministic mode must apply both on its own, without
+    // needing the separate `compact_floats` opt-in.
     assert_eq!(hex(&to_vec_deterministic(&1.5f64).unwrap()), "f93e00");
     assert_eq!(hex(&to_vec_deterministic(&4.0f32).unwrap()), "f94400");
     assert_eq!(
@@ -200,14 +200,23 @@ fn deterministic_mode_uses_preferred_float_encoding_without_compact_floats_featu
         "fb7e37e43c8800759c"
     );
 
-    // Without the `compact_floats` feature, non-deterministic encoding keeps
-    // the original fast path: no shrinking. (With the feature enabled,
-    // `to_vec` shrinks too - that's covered by the `compact_floats` tests.)
-    #[cfg(not(feature = "compact_floats"))]
-    {
-        assert_eq!(hex(&to_vec(&1.5f64).unwrap()), "fb3ff8000000000000");
-        assert_eq!(hex(&to_vec(&4.0f32).unwrap()), "fa40800000");
-    }
+    // Plain `to_vec` keeps the original fast path: no shrinking.
+    assert_eq!(hex(&to_vec(&1.5f64).unwrap()), "fb3ff8000000000000");
+    assert_eq!(hex(&to_vec(&4.0f32).unwrap()), "fa40800000");
+
+    // `Encoder::set_compact_floats` shrinks on the non-deterministic path
+    // too, without requiring sorted-key buffering.
+    assert_eq!(hex(&to_vec_compact(&1.5f64)), "f93e00");
+    assert_eq!(hex(&to_vec_compact(&4.0f32)), "f94400");
+}
+
+fn to_vec_compact<T: Serialize>(value: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    Encoder::new(&mut buf)
+        .set_compact_floats(true)
+        .encode(value)
+        .unwrap();
+    buf
 }
 
 #[test]
