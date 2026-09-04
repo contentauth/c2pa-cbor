@@ -20,6 +20,8 @@ use serde::{
     de::{self, Visitor},
 };
 
+use crate::tags;
+
 /// Dynamic CBOR value type for working with untyped CBOR data
 ///
 /// This type can represent any CBOR value without knowing its type at compile time.
@@ -82,11 +84,8 @@ impl Serialize for Value {
             Value::Array(a) => a.serialize(serializer),
             Value::Map(m) => m.serialize(serializer),
             Value::Tag(tag, value) => {
-                crate::tags::set_tag(Some(*tag));
-                let result =
-                    serializer.serialize_newtype_struct(crate::tags::TAG_MARKER_NAME, value);
-                crate::tags::set_tag(None);
-                result
+                let _guard = tags::TagGuard::new(*tag);
+                serializer.serialize_newtype_struct(tags::TAG_MARKER_NAME, value)
             }
         }
     }
@@ -97,6 +96,31 @@ impl<'de> Deserialize<'de> for Value {
     where
         D: Deserializer<'de>,
     {
+        // Wraps a freshly-constructed leaf `Value` in nested `Value::Tag`s for
+        // every CBOR tag that was just read for it. The decoder pushes each
+        // tag number onto a stack immediately before dispatching to whichever
+        // visitor method matches the tagged item's shape (see
+        // `Decoder::deserialize_any_impl`'s `MAJOR_TAG` arm), so draining the
+        // whole stack here - as the very first thing each visitor method does
+        // - always captures exactly the tags that apply to this value, never
+        // ones belonging to a parent (already consumed further up the call
+        // stack) or a child (not yet read off the wire). A CBOR tag can
+        // directly wrap another tag (e.g. `tag(1)(tag(2)(5))`), which is why
+        // this drains every pending tag rather than just one: by the time `5`
+        // is decoded, both 1 and 2 are pending, outermost pushed first, so
+        // re-wrapping in reverse (innermost/last-pushed first) reconstructs
+        // `Tag(1, Tag(2, Integer(5)))`.
+        fn tagged(value: Value) -> Value {
+            wrap_tags(value, tags::take_all_tags())
+        }
+
+        fn wrap_tags(mut value: Value, tags: Vec<u64>) -> Value {
+            for tag in tags.into_iter().rev() {
+                value = Value::Tag(tag, Box::new(value));
+            }
+            value
+        }
+
         struct ValueVisitor;
 
         impl<'de> Visitor<'de> for ValueVisitor {
@@ -107,113 +131,126 @@ impl<'de> Deserialize<'de> for Value {
             }
 
             fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
-                Ok(Value::Bool(value))
+                Ok(tagged(Value::Bool(value)))
             }
 
             fn visit_i8<E>(self, value: i8) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_i16<E>(self, value: i16) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_i32<E>(self, value: i32) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
-                Ok(Value::Integer(value))
+                Ok(tagged(Value::Integer(value)))
             }
 
             fn visit_u8<E>(self, value: u8) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_u16<E>(self, value: u16) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_u32<E>(self, value: u32) -> Result<Value, E> {
-                Ok(Value::Integer(value as i64))
+                Ok(tagged(Value::Integer(value as i64)))
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Value, E>
             where
                 E: de::Error,
             {
+                // Drain the tags before the fallible check below, so they can
+                // never leak into a later, unrelated decode if this errors.
+                let tags = tags::take_all_tags();
                 if value <= i64::MAX as u64 {
-                    Ok(Value::Integer(value as i64))
+                    Ok(wrap_tags(Value::Integer(value as i64), tags))
                 } else {
                     Err(E::custom(format!("u64 value {} too large for i64", value)))
                 }
             }
 
             fn visit_f32<E>(self, value: f32) -> Result<Value, E> {
-                Ok(Value::Float(value as f64))
+                Ok(tagged(Value::Float(value as f64)))
             }
 
             fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
-                Ok(Value::Float(value))
+                Ok(tagged(Value::Float(value)))
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Value, E>
             where
                 E: de::Error,
             {
-                Ok(Value::Text(value.to_owned()))
+                Ok(tagged(Value::Text(value.to_owned())))
             }
 
             fn visit_string<E>(self, value: String) -> Result<Value, E> {
-                Ok(Value::Text(value))
+                Ok(tagged(Value::Text(value)))
             }
 
             fn visit_bytes<E>(self, value: &[u8]) -> Result<Value, E>
             where
                 E: de::Error,
             {
-                Ok(Value::Bytes(value.to_vec()))
+                Ok(tagged(Value::Bytes(value.to_vec())))
             }
 
             fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Value, E> {
-                Ok(Value::Bytes(value))
+                Ok(tagged(Value::Bytes(value)))
             }
 
             fn visit_none<E>(self) -> Result<Value, E> {
-                Ok(Value::Null)
+                Ok(tagged(Value::Null))
             }
 
             fn visit_some<D>(self, deserializer: D) -> Result<Value, D::Error>
             where
                 D: Deserializer<'de>,
             {
-                Deserialize::deserialize(deserializer)
+                // Take the tags before recursing: decoding the wrapped value
+                // may itself see (and consume) tags of its own.
+                let tags = tags::take_all_tags();
+                let inner = Deserialize::deserialize(deserializer)?;
+                Ok(wrap_tags(inner, tags))
             }
 
             fn visit_unit<E>(self) -> Result<Value, E> {
-                Ok(Value::Null)
+                Ok(tagged(Value::Null))
             }
 
             fn visit_seq<V>(self, mut visitor: V) -> Result<Value, V::Error>
             where
                 V: de::SeqAccess<'de>,
             {
+                // Take the tags before iterating: decoding an element may
+                // itself see (and consume) tags of its own.
+                let tags = tags::take_all_tags();
                 let mut vec = Vec::new();
                 while let Some(elem) = visitor.next_element()? {
                     vec.push(elem);
                 }
-                Ok(Value::Array(vec))
+                Ok(wrap_tags(Value::Array(vec), tags))
             }
 
             fn visit_map<V>(self, mut visitor: V) -> Result<Value, V::Error>
             where
                 V: de::MapAccess<'de>,
             {
+                // Take the tags before iterating: decoding an entry may
+                // itself see (and consume) tags of its own.
+                let tags = tags::take_all_tags();
                 let mut map = BTreeMap::new();
                 while let Some((key, value)) = visitor.next_entry()? {
                     map.insert(key, value);
                 }
-                Ok(Value::Map(map))
+                Ok(wrap_tags(Value::Map(map), tags))
             }
 
             // Only reached when the decoder is in tag-capturing mode (see
@@ -1278,24 +1315,36 @@ mod tests {
     }
 
     #[test]
-    fn test_value_tag_round_trips_via_from_tagged_slice() {
-        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
-        let bytes = to_vec(&value).unwrap();
-
-        let decoded = Value::from_tagged_slice(&bytes).unwrap();
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn test_value_tag_transparent_via_plain_from_slice() {
-        // Plain from_slice (the default, non-tag-aware path) intentionally
-        // drops the tag, matching how any other type transparently ignores
-        // a leading CBOR tag.
+    fn test_value_tag_round_trips_via_plain_from_slice() {
+        // Regression test for https://github.com/contentauth/c2pa-cbor/issues/27:
+        // Value::Tag previously serialized only its inner value on encode,
+        // and decode never reconstructed Value::Tag at all, so the tag was
+        // silently dropped in both directions.
         let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
         let bytes = to_vec(&value).unwrap();
 
         let decoded: Value = from_slice(&bytes).unwrap();
-        assert_eq!(decoded, Value::Text("https://example.com".to_string()));
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_distinguishes_structurally_similar_cose_tags() {
+        // COSE_Mac0 (17), COSE_Sign1 (18), and COSE_Sign (98) are all "an
+        // array of four items" - the tag is the only signal distinguishing
+        // them. Before the fix, every tag was dropped, so all three
+        // collapsed into the same untagged Value.
+        for (bytes, expected_tag) in [
+            (vec![0xd1u8, 0x01], 17u64),  // tag 17 COSE_Mac0
+            (vec![0xd2, 0x01], 18),       // tag 18 COSE_Sign1
+            (vec![0xd8, 0x62, 0x01], 98), // tag 98 COSE_Sign
+        ] {
+            let decoded: Value = from_slice(&bytes).unwrap();
+            assert_eq!(
+                decoded,
+                Value::Tag(expected_tag, Box::new(Value::Integer(1)))
+            );
+            assert!(decoded.is_tag());
+        }
     }
 
     #[test]
@@ -1313,8 +1362,28 @@ mod tests {
         ]);
         let bytes = to_vec(&value).unwrap();
 
-        let decoded = Value::from_tagged_slice(&bytes).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_does_not_leak_into_sibling_field() {
+        // A tag stashed while decoding one field must not bleed into an
+        // adjacent field decoded as Value, even though both share the same
+        // decoder session (and thus the same tag side-channel).
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Pair {
+            a: Value,
+            b: Value,
+        }
+
+        let pair = Pair {
+            a: Value::Tag(1, Box::new(Value::Integer(1))),
+            b: Value::Integer(2),
+        };
+        let bytes = to_vec(&pair).unwrap();
+        let decoded: Pair = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, pair);
     }
 
     #[test]
@@ -1323,7 +1392,53 @@ mod tests {
         // be encoded at all; arbitrary tags now work too.
         let value = Value::Tag(123456, Box::new(Value::Integer(1)));
         let bytes = to_vec(&value).unwrap();
-        let decoded = Value::from_tagged_slice(&bytes).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_directly_wrapping_tag_round_trips() {
+        // Regression test: a CBOR tag can directly wrap another tag (no
+        // array/map/option in between), e.g. `tag(1)(tag(2)(5))`. The first
+        // cut of tag support only drained one pending tag per decoded value,
+        // so the inner tag's `TagGuard` clobbered the outer tag on the
+        // thread-local stack before anything ever consumed it, silently
+        // dropping it.
+        let value = Value::Tag(1, Box::new(Value::Tag(2, Box::new(Value::Integer(5)))));
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(bytes, vec![0xc1, 0xc2, 0x05]);
+
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_triple_nested_round_trips() {
+        let value = Value::Tag(
+            1,
+            Box::new(Value::Tag(
+                2,
+                Box::new(Value::Tag(3, Box::new(Value::Text("x".to_string())))),
+            )),
+        );
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_wrapping_tagged_array_round_trips() {
+        // A tag directly wraps another tag, which itself wraps an array -
+        // exercises the wrap_tags fold inside visit_seq.
+        let value = Value::Tag(
+            1,
+            Box::new(Value::Tag(
+                2,
+                Box::new(Value::Array(vec![Value::Integer(1), Value::Integer(2)])),
+            )),
+        );
+        let bytes = to_vec(&value).unwrap();
+        let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(decoded, value);
     }
 }

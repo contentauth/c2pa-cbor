@@ -13,7 +13,7 @@
 
 // Portions derived from serde_cbor (https://github.com/pyfisch/cbor)
 
-use std::{cell::Cell, fmt, io::Write, marker::PhantomData};
+use std::{cell::RefCell, fmt, io::Write, marker::PhantomData};
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -23,26 +23,78 @@ use serde::{
 use crate::{Decoder, Encoder, Result, constants::*};
 
 thread_local! {
-    static CURRENT_TAG: Cell<Option<u64>> = const { Cell::new(None) };
+    // A stack rather than a single slot: CBOR permits a tag to directly wrap
+    // another tag (e.g. `tag(1)(tag(2)(5))`), and decoding that nests two
+    // `TagGuard`s before either tag is consumed by a leaf visitor. A single
+    // slot would let the inner push clobber the outer tag; the stack lets
+    // both survive until `take_all_tags` drains them together, innermost
+    // last-pushed.
+    static TAG_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Sentinel newtype-struct name used internally to smuggle a runtime CBOR tag
 /// number (any `u64`) across the generic `Serializer`/`Deserializer`
-/// boundary via [`CURRENT_TAG`], since `serialize_newtype_struct` only
+/// boundary via [`TAG_STACK`], since `serialize_newtype_struct` only
 /// accepts a `&'static str` name and can't carry a dynamic value directly.
 /// Contains an interior NUL byte so it can never collide with a real Rust
 /// type name.
 pub(crate) const TAG_MARKER_NAME: &str = "\0c2pa_cbor_tag\0";
 
-/// Stash a tag number to be picked up by the encoder/decoder on the very
-/// next `TAG_MARKER_NAME` newtype-struct call.
-pub(crate) fn set_tag(tag: Option<u64>) {
-    CURRENT_TAG.with(|cell| cell.set(tag));
+/// Pop the most recently pushed tag, if any. Used by the encoder, which
+/// consumes (and writes) a tag immediately upon seeing the
+/// `TAG_MARKER_NAME` newtype-struct call, before recursing into the wrapped
+/// value - so at most one tag is ever pending at a time on that path, even
+/// for directly-nested tags.
+pub(crate) fn take_tag() -> Option<u64> {
+    TAG_STACK.with(|stack| stack.borrow_mut().pop())
 }
 
-/// Read and clear the currently stashed tag number, if any.
-pub(crate) fn take_tag() -> Option<u64> {
-    CURRENT_TAG.with(|cell| cell.take())
+/// Drain every currently pending tag, outermost first. Used by `Value`'s
+/// decode path, where a leaf value may have any number of tags stacked up
+/// directly around it (e.g. `tag(1)(tag(2)(5))` stacks `[1, 2]` by the time
+/// `5` is decoded); the caller should re-wrap the value with each tag in
+/// reverse (innermost/last first) to reconstruct the original nesting.
+pub(crate) fn take_all_tags() -> Vec<u64> {
+    TAG_STACK.with(|stack| std::mem::take(&mut *stack.borrow_mut()))
+}
+
+/// RAII guard that pushes a tag number onto [`TAG_STACK`] for [`take_tag`]/
+/// [`take_all_tags`] to pick up, and unconditionally pops it back off when
+/// dropped - including if the code that runs while it's pushed panics - so a
+/// tag can never leak into an unrelated later encode/decode on the same
+/// thread. Anywhere a tag is stashed before running arbitrary recursive
+/// `Serialize`/`Deserialize` code should use this guard rather than pushing
+/// onto the stack directly.
+///
+/// If the pushed tag was already consumed (by `take_tag`/`take_all_tags`)
+/// before this guard drops - the expected case - dropping is a no-op: the
+/// guard only truncates the stack when it finds its own entry still there,
+/// so it never pops a tag that belongs to an unrelated, still-pending guard
+/// further down the stack.
+pub(crate) struct TagGuard {
+    depth: usize,
+}
+
+impl TagGuard {
+    pub(crate) fn new(tag: u64) -> Self {
+        let depth = TAG_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            stack.push(tag);
+            stack.len()
+        });
+        TagGuard { depth }
+    }
+}
+
+impl Drop for TagGuard {
+    fn drop(&mut self) {
+        TAG_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() >= self.depth {
+                stack.truncate(self.depth - 1);
+            }
+        });
+    }
 }
 
 /// A tagged CBOR value
@@ -116,10 +168,8 @@ impl<T: Serialize> Serialize for Tagged<T> {
     {
         match self.tag {
             Some(tag) => {
-                set_tag(Some(tag));
-                let result = serializer.serialize_newtype_struct(TAG_MARKER_NAME, &self.value);
-                set_tag(None);
-                result
+                let _guard = TagGuard::new(tag);
+                serializer.serialize_newtype_struct(TAG_MARKER_NAME, &self.value)
             }
             None => {
                 // No tag, just serialize the value directly
@@ -639,6 +689,69 @@ mod tests {
     }
 
     #[test]
+    fn test_tagged_serialize_arbitrary_tag_number() {
+        // Regression test for https://github.com/contentauth/c2pa-cbor/issues/27:
+        // Tagged<T> used to support only a hardcoded whitelist of ~30 tag
+        // numbers (erroring on anything else). COSE tags like 17/18/98
+        // weren't on that list; Tagged<T> now supports any u64 tag.
+        let tagged = Tagged::new(Some(18), 1u64); // tag 18: COSE_Sign1
+        let cbor = crate::to_vec(&tagged).unwrap();
+        assert_eq!(cbor, vec![0xd2, 0x01]);
+
+        let decoded = Tagged::<u64>::from_tagged_slice(&cbor).unwrap();
+        assert_eq!(decoded.tag, Some(18));
+        assert_eq!(decoded.value, 1);
+    }
+
+    #[test]
+    fn test_tag_guard_cleans_up_after_panic() {
+        // Regression test: the tag number is stashed in a thread-local while
+        // a tag is "in flight", so if the recursive serialize/deserialize
+        // call in between panics, a naive set-then-clear pattern would skip
+        // the clear on unwind - leaking the tag into whatever unrelated
+        // encode/decode runs next on the same thread. TagGuard's Drop impl
+        // must clean up even when unwinding.
+
+        // Verify that TagGuard properly cleans up its entry from the stack
+        // even when dropped early (simulating panic cleanup behavior).
+
+        // Initially, tag stack should be empty
+        assert_eq!(take_all_tags(), Vec::<u64>::new());
+
+        // Push a tag via TagGuard
+        {
+            let _guard = TagGuard::new(99);
+            // While guard is in scope, tag should be on stack
+            let tags = TAG_STACK.with(|stack| stack.borrow().len());
+            assert_eq!(tags, 1);
+        } // Guard drops here
+
+        // After guard is dropped, stack should be clean
+        assert_eq!(take_all_tags(), Vec::<u64>::new());
+
+        // Test nested guards (simulating nested tags)
+        {
+            let _guard1 = TagGuard::new(99);
+            {
+                let _guard2 = TagGuard::new(100);
+                let tags = TAG_STACK.with(|stack| stack.borrow().len());
+                assert_eq!(tags, 2);
+            } // Inner guard drops
+
+            let tags = TAG_STACK.with(|stack| stack.borrow().len());
+            assert_eq!(tags, 1); // Only outer guard remains
+        } // Outer guard drops
+
+        assert_eq!(take_all_tags(), Vec::<u64>::new());
+
+        // Verify that unrelated encode/decode operations work correctly
+        // after tag guard cleanup
+        assert_eq!(crate::to_vec(&42u64).unwrap(), vec![0x18, 0x2a]);
+        let decoded: crate::Value = crate::from_slice(&[0x00]).unwrap();
+        assert_eq!(decoded, crate::Value::Integer(0));
+    }
+
+    #[test]
     fn test_encode_float16be_array() {
         // Test f16 big-endian array encoding
         // u16 values represent the raw IEEE 754 binary16 bits
@@ -674,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tagged_serialize_arbitrary_tag_number() {
+    fn test_tagged_serialize_arbitrary_tag_number_large() {
         // Previously, tags outside a hardcoded whitelist (~30 registered RFC
         // tags) errored with "not supported via Tagged<T>". Any tag number
         // now works.

@@ -17,7 +17,7 @@ use std::io::Write;
 
 use serde::Serialize;
 
-use crate::{Error, Result, constants::*};
+use crate::{Error, Result, constants::*, tags};
 
 // Encoder
 pub struct Encoder<W: Write> {
@@ -177,6 +177,10 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
     type SerializeTupleStruct = SerializeVec<'a, W>;
     type SerializeTupleVariant = &'a mut Encoder<W>;
 
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+
     fn serialize_bool(self, v: bool) -> Result<()> {
         let val = if v { TRUE } else { FALSE };
         self.writer.write_all(&[(MAJOR_SIMPLE << 5) | val])?;
@@ -288,8 +292,8 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
         T: ?Sized + Serialize,
     {
         // Check if this is the special CBOR tag marker from Tagged<T>/Value::Tag
-        if name == crate::tags::TAG_MARKER_NAME {
-            if let Some(tag) = crate::tags::take_tag() {
+        if name == tags::TAG_MARKER_NAME {
+            if let Some(tag) = tags::take_tag() {
                 self.write_tag(tag)?;
             }
             return value.serialize(self);
