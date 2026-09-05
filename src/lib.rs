@@ -1642,6 +1642,35 @@ mod tests {
         assert_eq!(decoded, 42);
     }
 
+    #[test]
+    fn test_encoder_to_writer_deterministic() {
+        let mut buf = Vec::new();
+        to_writer_deterministic(&mut buf, &42i32).unwrap();
+        let decoded: i32 = from_slice(&buf).unwrap();
+        assert_eq!(decoded, 42);
+    }
+
+    #[test]
+    fn test_to_writer_deterministic_matches_to_vec_deterministic() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct S {
+            zebra: i32,
+            apple: i32,
+        }
+        let s = S { zebra: 1, apple: 2 };
+
+        let mut buf = Vec::new();
+        to_writer_deterministic(&mut buf, &s).unwrap();
+
+        // Same sorted-key output as the Vec-returning entry point, and
+        // different from declaration-order `to_writer`.
+        assert_eq!(buf, to_vec_deterministic(&s).unwrap());
+        assert_ne!(buf, to_vec(&s).unwrap());
+
+        let decoded: S = from_slice(&buf).unwrap();
+        assert_eq!(decoded, s);
+    }
+
     // ============================================================================
     // Comprehensive Deserialization Coverage Tests
     // ============================================================================

@@ -17,11 +17,19 @@
 
 use std::collections::HashMap;
 
-use c2pa_cbor::{Encoder, Value, from_slice, to_vec, to_vec_deterministic};
+use c2pa_cbor::{
+    Encoder, Value, from_slice, to_vec, to_vec_deterministic, to_writer_deterministic,
+};
 use serde::{Deserialize, Serialize};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn to_vec_via_writer_deterministic<T: Serialize>(value: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    to_writer_deterministic(&mut buf, value).unwrap();
+    buf
 }
 
 #[test]
@@ -233,6 +241,68 @@ fn deterministic_mode_canonicalizes_nan_regardless_of_source_bit_pattern() {
         assert_eq!(hex(&to_vec_deterministic(&nan).unwrap()), "f97e00");
         assert_eq!(hex(&to_vec_deterministic(&(nan as f32)).unwrap()), "f97e00");
     }
+}
+
+#[test]
+fn to_writer_deterministic_sorts_struct_fields_same_as_to_vec_deterministic() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct S {
+        zebra: i32,
+        apple: i32,
+        b: i32,
+        aa: i32,
+    }
+
+    let s = S {
+        zebra: 1,
+        apple: 2,
+        b: 3,
+        aa: 4,
+    };
+
+    let encoded = to_vec_via_writer_deterministic(&s);
+    assert_eq!(
+        hex(&encoded),
+        "a461620362616104656170706c6502657a6562726101"
+    );
+    // The writer and Vec entry points must agree byte-for-byte.
+    assert_eq!(encoded, to_vec_deterministic(&s).unwrap());
+
+    let decoded: S = from_slice(&encoded).unwrap();
+    assert_eq!(decoded, s);
+}
+
+#[test]
+fn to_writer_deterministic_rejects_duplicate_keys() {
+    #[derive(Serialize)]
+    struct Outer {
+        name: String,
+        #[serde(flatten)]
+        extra: HashMap<String, String>,
+    }
+
+    let mut extra = HashMap::new();
+    extra.insert("name".to_string(), "duplicate!".to_string());
+    let outer = Outer {
+        name: "original".to_string(),
+        extra,
+    };
+
+    let mut buf = Vec::new();
+    let err = to_writer_deterministic(&mut buf, &outer).unwrap_err();
+    assert!(err.to_string().contains("duplicate"), "{}", err);
+}
+
+#[test]
+fn to_writer_deterministic_canonicalizes_nan_and_shortens_floats() {
+    assert_eq!(hex(&to_vec_via_writer_deterministic(&1.5f64)), "f93e00");
+    assert_eq!(hex(&to_vec_via_writer_deterministic(&4.0f32)), "f94400");
+
+    let payload_nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    assert_eq!(
+        hex(&to_vec_via_writer_deterministic(&payload_nan)),
+        "f97e00"
+    );
 }
 
 #[test]
