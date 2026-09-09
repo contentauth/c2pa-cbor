@@ -15,6 +15,78 @@
 
 // NOTE: we don't use serde_cbor here, we just verify we can emulate it.
 use c2pa_cbor as serde_cbor;
+use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
+
+const OCSP_RESPONSE: &[u8] = &[0x30, 0x82, 0xff, 0x01];
+const OCSP_RESPONSE_BASE64: &str = "MIL/AQ==";
+
+#[derive(Debug, PartialEq)]
+struct FormatAwareOcsp(Vec<u8>);
+
+impl Serialize for FormatAwareOcsp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(OCSP_RESPONSE_BASE64)
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FormatAwareOcsp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            if String::deserialize(deserializer)? != OCSP_RESPONSE_BASE64 {
+                return Err(serde::de::Error::custom("unexpected OCSP response"));
+            }
+            Ok(Self(OCSP_RESPONSE.to_vec()))
+        } else {
+            ByteBuf::deserialize(deserializer).map(|bytes| Self(bytes.into_vec()))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+struct CertificateStatus {
+    #[serde(rename = "ocspVals")]
+    ocsp_vals: Vec<FormatAwareOcsp>,
+}
+
+#[test]
+fn format_aware_ocsp_uses_binary_cbor_and_base64_json() {
+    let original = CertificateStatus {
+        ocsp_vals: vec![FormatAwareOcsp(OCSP_RESPONSE.to_vec())],
+    };
+    let encoded = c2pa_cbor::to_vec(&original).unwrap();
+    let c2pa_cbor::Value::Map(values) = c2pa_cbor::from_slice(&encoded).unwrap() else {
+        panic!("certificate status must be a CBOR map");
+    };
+
+    assert_eq!(
+        values.get(&c2pa_cbor::Value::Text("ocspVals".to_owned())),
+        Some(&c2pa_cbor::Value::Array(vec![c2pa_cbor::Value::Bytes(
+            OCSP_RESPONSE.to_vec()
+        )]))
+    );
+    assert_eq!(
+        c2pa_cbor::from_slice::<CertificateStatus>(&encoded).unwrap(),
+        original
+    );
+
+    let json = serde_json::to_string(&original).unwrap();
+    assert_eq!(json, r#"{"ocspVals":["MIL/AQ=="]}"#);
+    assert_eq!(
+        serde_json::from_str::<CertificateStatus>(&json).unwrap(),
+        original
+    );
+}
 
 #[test]
 fn test_value_module_compat() {

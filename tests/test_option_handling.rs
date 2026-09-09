@@ -514,3 +514,34 @@ fn test_serialization_paths() {
     // Both produce valid definite-length CBOR (required for C2PA)
     // The difference is internal: fast path writes directly, buffered path collects first
 }
+
+// Regression test for https://github.com/contentauth/c2pa-cbor/issues/22
+// PrefetchedDeserializer (used for Option<T>) didn't handle CBOR floats
+// (major type 7, info 25/26/27), only booleans.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct Shape {
+    width: Option<f64>,
+    height: Option<f64>,
+    scale: Option<f32>,
+}
+
+#[test]
+fn test_option_float_round_trip() {
+    let with_values = Shape {
+        width: Some(12.5),
+        height: Some(0.0),
+        scale: Some(2.5),
+    };
+    let cbor = c2pa_cbor::to_vec(&with_values).expect("serialize");
+    let decoded: Shape = c2pa_cbor::from_slice(&cbor).expect("deserialize");
+    assert_eq!(with_values, decoded);
+
+    let all_none = Shape {
+        width: None,
+        height: None,
+        scale: None,
+    };
+    let cbor = c2pa_cbor::to_vec(&all_none).expect("serialize");
+    let decoded: Shape = c2pa_cbor::from_slice(&cbor).expect("deserialize");
+    assert_eq!(all_none, decoded);
+}
