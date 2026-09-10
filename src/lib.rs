@@ -2679,12 +2679,17 @@ mod tests {
         let mut decoder = Decoder::new(Cursor::new(&cbor));
         let result: Result<Value> = decoder.decode();
         assert!(result.is_err());
-        // Either caught by overflow check or allocation limit
+        // Rejected safely without attempting a giant allocation: on 32-bit by
+        // the usize overflow check ("platform"); with an allocation limit set
+        // by "exceeds maximum"; and otherwise (no limit) by reading
+        // incrementally and hitting end-of-input, since read_bytes no longer
+        // eagerly reserves the claimed length.
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("exceeds maximum")
-                || err_str.contains("out of memory")
                 || err_str.contains("platform")
+                || err_str.contains("end of input"),
+            "unexpected error: {err_str}"
         );
     }
 
