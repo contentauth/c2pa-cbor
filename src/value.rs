@@ -607,9 +607,15 @@ impl Serializer for ValueSerializer {
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<Value, crate::Error> {
+        // Check if this is the special CBOR tag marker from Tagged<T>/Value::Tag
+        if name == tags::TAG_MARKER_NAME
+            && let Some(tag) = tags::take_tag()
+        {
+            return Ok(Value::Tag(tag, Box::new(value.serialize(self)?)));
+        }
         value.serialize(self)
     }
 
@@ -1325,6 +1331,17 @@ mod tests {
 
         let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_round_trips_via_to_value() {
+        // Regression test: ValueSerializer::serialize_newtype_struct ignored
+        // the TAG_MARKER_NAME sentinel, so to_value() silently dropped the
+        // tag even though the binary Encoder (to_vec) handled it correctly.
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+
+        let round_tripped = to_value(value.clone()).unwrap();
+        assert_eq!(round_tripped, value);
     }
 
     #[test]
