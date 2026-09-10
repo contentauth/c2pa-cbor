@@ -785,4 +785,17 @@ mod tests {
         // Verify the bytes are little-endian
         assert!(buf.len() >= 6); // tag + header + 6 bytes of data
     }
+
+    #[test]
+    fn test_tagged_serialize_arbitrary_tag_number_large() {
+        // Previously, tags outside a hardcoded whitelist (~30 registered RFC
+        // tags) errored with "not supported via Tagged<T>". Any tag number
+        // now works.
+        let tagged = Tagged::new(Some(123456), "custom".to_string());
+        let cbor = crate::to_vec(&tagged).unwrap();
+
+        let decoded = Tagged::<String>::from_tagged_slice(&cbor).unwrap();
+        assert_eq!(decoded.tag, Some(123456));
+        assert_eq!(decoded.value, "custom");
+    }
 }

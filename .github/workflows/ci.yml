@@ -160,7 +160,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation toolset
-        run: cargo install cross
+        # --locked uses cross's pinned Cargo.lock; without it, cargo resolves
+        # newer transitive deps (e.g. textwrap 0.16.3) whose MSRV exceeds the
+        # 1.88.0 toolchain in this matrix and the install fails to compile.
+        run: cargo install cross --locked
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

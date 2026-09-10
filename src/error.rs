@@ -28,8 +28,12 @@ pub enum Error {
     Syntax(String),
     /// Trailing data after value
     TrailingData,
-    /// General message (serde compatibility)
-    Message(String),
+    /// Error raised internally by the encoder (e.g. a value that can't be
+    /// represented, or a serde call sequence the encoder doesn't support)
+    Encoding(String),
+    /// Custom error from a `Serialize`/`Deserialize` impl, via serde's
+    /// `Error::custom` (serde compatibility)
+    Serde(String),
 }
 
 impl std::fmt::Display for Error {
@@ -40,7 +44,8 @@ impl std::fmt::Display for Error {
             Error::Eof => write!(f, "Unexpected end of input"),
             Error::Syntax(s) => write!(f, "Syntax error: {}", s),
             Error::TrailingData => write!(f, "Trailing data"),
-            Error::Message(s) => write!(f, "{}", s),
+            Error::Encoding(s) => write!(f, "Encoding error: {}", s),
+            Error::Serde(s) => write!(f, "{}", s),
         }
     }
 }
@@ -55,13 +60,13 @@ impl From<io::Error> for Error {
 
 impl serde::ser::Error for Error {
     fn custom<T: std::fmt::Display>(msg: T) -> Self {
-        Error::Message(msg.to_string())
+        Error::Serde(msg.to_string())
     }
 }
 
 impl serde::de::Error for Error {
     fn custom<T: std::fmt::Display>(msg: T) -> Self {
-        Error::Message(msg.to_string())
+        Error::Serde(msg.to_string())
     }
 }
 

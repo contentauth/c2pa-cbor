@@ -4,18 +4,19 @@ A fast, lightweight CBOR (Concise Binary Object Representation) encoder/decoder 
 
 ## Features
 
-- ✅ Full support for all CBOR major types (0-7)
-- ✅ Tagged types (major type 6) with standard tags:
+- Full support for all CBOR major types (0-7)
+- Tagged types (major type 6) with standard tags:
   - Date/time strings (tag 0) and epoch timestamps (tag 1)
   - URIs (tag 32)
   - Base64url and Base64 encoded data (tags 33, 34)
   - RFC 8746 typed arrays (tags 64-87) for efficient binary data
-- ✅ Custom tag support via `write_tag()` and `read_tag()` methods
-- ✅ Excellent performance with near-zero overhead
-- ✅ Serde integration for seamless serialization
-- ✅ **Full `serde_transcode` support** - handles `#[serde(flatten)]` and other advanced features
-- ✅ **Backward compatible newtype struct handling** - works with existing CBOR data
-- ✅ **Deterministic encoding** - always produces definite-length CBOR (required for C2PA)
+- Custom tag support via `write_tag()` and `read_tag()` methods
+- Excellent performance with near-zero overhead
+- Serde integration for seamless serialization
+- **Full `serde_transcode` support** - handles `#[serde(flatten)]` and other advanced features
+- **Backward compatible newtype struct handling** - works with existing CBOR data
+- **Always definite-length output** - indefinite-length CBOR is never produced
+- **Opt-in deterministic encoding** - RFC 8949 §4.2.1 Core Deterministic Encoding Requirements compliant (sorted map/struct keys, shortest-form floats, canonical NaN), required for C2PA manifests
 
 ## Security
 
@@ -46,13 +47,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"  # For efficient byte array handling
 ```
 
-### Optional Features
+### Compact Float Encoding
 
-- **`compact_floats`**: Enable optimal float encoding (f16/f32/f64 based on precision needed)
-  - By default, all f64 values encode as 8 bytes for maximum compatibility
-  - With this feature, values like `0.0` or `2.5` encode as f16 (2 bytes) when lossless
-  - Matches RFC 8949 preferred encoding but may not work with older CBOR decoders
-  - Enable with: `c2pa_cbor = { version = "0.1", features = ["compact_floats"] }`
+By default, `to_vec`/`to_writer` encode floats at their original width (f32 stays 4 bytes, f64 stays 8 bytes) for maximum compatibility. [Deterministic mode](#deterministic-encoding) (`to_vec_deterministic` etc.) always uses shortest-form float encoding, since RFC 8949 §4.2.1 requires it.
+
+To get the same shortest-form encoding on the non-deterministic path, without opting into deterministic mode's sorted-key buffering, use `Encoder::new(writer).set_compact_floats(true)`. Values like `0.0` or `2.5` then encode as f16 (2 bytes) when lossless. This matches RFC 8949 preferred encoding but may not work with older CBOR decoders.
 
 ## Quick Start
 
@@ -163,12 +162,15 @@ struct Config {
 // Convert JSON to CBOR via transcode
 let json_str = r#"{"name":"app","version":"1.0","debug":true}"#;
 let mut from = serde_json::Deserializer::from_str(json_str);
-let mut to = c2pa_cbor::ser::Serializer::new(Vec::new());
+// set_deterministic(true) sorts flattened keys by their encoded bytes,
+// which C2PA manifests require (RFC 8949 §4.2.1); omit it to preserve
+// declaration/insertion order instead.
+let mut to = c2pa_cbor::ser::Serializer::new(Vec::new()).set_deterministic(true);
 
 serde_transcode::transcode(&mut from, &mut to).unwrap();
 let cbor_bytes = to.into_inner();
 
-// The CBOR is always definite-length (required for C2PA signatures)
+// The CBOR is always definite-length, regardless of the deterministic setting
 let config: Config = c2pa_cbor::from_slice(&cbor_bytes).unwrap();
 ```
 
@@ -188,12 +190,12 @@ This implementation is designed for **speed** with binary byte arrays:
 - **Scales linearly**: Performance improves with larger data sizes
 
 ### Key Performance Features
-- ✅ Zero allocations during encoding
-- ✅ Single allocation during decoding
-- ✅ No per-element overhead with `serde_bytes`
-- ✅ Direct memory writes (no intermediate buffers)
-- ✅ Near memory bandwidth performance (50+ GB/s)
-- ✅ **Dual-path architecture**: Zero overhead for normal serialization, automatic buffering only when needed
+- Zero allocations during encoding
+- Single allocation during decoding
+- No per-element overhead with `serde_bytes`
+- Direct memory writes (no intermediate buffers)
+- Near memory bandwidth performance (50+ GB/s)
+- **Dual-path architecture**: Zero overhead for normal serialization, automatic buffering only when needed
 
 ## Architecture
 
@@ -204,12 +206,13 @@ This library uses a **smart dual-path serialization strategy**:
 2. **Buffering Path (rare cases)**: When sizes are unknown (e.g., `#[serde(flatten)]` with `serde_transcode`), entries are buffered and written as definite-length once the count is known.
 
 This design ensures:
-- ✅ **Optimal performance** for typical use cases
-- ✅ **Full serde compatibility** including advanced features
-- ✅ **Deterministic output** (always definite-length, never indefinite)
-- ✅ **C2PA compliance** (required for digital signatures)
+- **Optimal performance** for typical use cases
+- **Full serde compatibility** including advanced features
+- **Definite-length output** (never indefinite), independent of whether deterministic mode is enabled
 
 The buffering path adds minimal overhead and only activates when necessary, making the library both fast and fully compatible with the serde ecosystem.
+
+Map and struct entries also always buffer when [deterministic mode](#deterministic-encoding) is enabled, since sorting keys requires seeing every entry first. C2PA manifests require deterministic mode; it is off by default for callers who only need definite-length output.
 
 
 ## Migration from serde_cbor
@@ -230,17 +233,20 @@ let decoded = c2pa_cbor::from_slice(&encoded)?;
 
 ### Key Improvements Over serde_cbor
 
-- ✅ **Handles `#[serde(flatten)]`** - No more "indefinite-length maps require manual encoding" errors
-- ✅ **Newtype struct compatibility** - Automatically handles tuple struct serialization correctly
-- ✅ **Better `serde_transcode` support** - Works seamlessly with JSON-to-CBOR conversion
-- ✅ **Always deterministic** - Produces definite-length CBOR in all cases
-- ✅ **Faster encoding** - Zero-overhead fast path for normal cases
+- **Handles `#[serde(flatten)]`** - No more "indefinite-length maps require manual encoding" errors
+- **Newtype struct compatibility** - Automatically handles tuple struct serialization correctly
+- **Better `serde_transcode` support** - Works seamlessly with JSON-to-CBOR conversion
+- **Always definite-length** - Produces definite-length CBOR in all cases, with opt-in RFC 8949 sorted-key determinism (`to_vec_deterministic`, matching serde_cbor's `to_vec_packed`)
+- **Faster encoding** - Zero-overhead fast path for normal cases
 
 ## API Overview
 
 ### Encoding Functions
 
-- `to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>>` - Encode any serializable value
+- `to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>>` - Encode any serializable value, preserving declaration/insertion order for map and struct keys
+- `to_vec_deterministic<T: Serialize>(value: &T) -> Result<Vec<u8>>` - Like `to_vec`, but sorts map and struct keys per RFC 8949 §4.2.1 (required for C2PA manifests)
+- `to_writer` / `to_writer_deterministic` - Writer-based equivalents of the above
+- `Encoder::set_deterministic(bool)` - Toggle sorted-key mode on the low-level `Encoder`
 - `encode_tagged<W, T>(writer, tag, value)` - Encode a tagged value
 - `encode_datetime_string(writer, datetime)` - Tag 0
 - `encode_epoch_datetime(writer, epoch)` - Tag 1
@@ -290,14 +296,21 @@ This implementation follows:
 
 ### Deterministic Encoding
 
-This library **always produces definite-length CBOR** (never indefinite-length), which ensures:
-- Deterministic output (same input always produces identical bytes)
-- C2PA compliance (required for verifiable digital signatures)
-- Compatibility with strict CBOR parsers
-
-This is achieved through:
+This library **always produces definite-length CBOR** (never indefinite-length), which ensures compatibility with strict CBOR parsers. This is achieved through:
 - Direct encoding when sizes are known (fast path)
 - Automatic buffering and counting when sizes are unknown (compatibility path)
+
+Definite-length output alone isn't enough to make CBOR byte-for-byte reproducible: map and struct key order still depends on source order (struct field declaration order, `HashMap` iteration order, etc.), and floats can be encoded at more than one width. For that, use **deterministic mode**, which implements RFC 8949 §4.2.1's Core Deterministic Encoding Requirement in full:
+- Map and struct entries are buffered and sorted by the bytewise-lexicographic order of their encoded key bytes, and duplicate keys are rejected
+- Floats are encoded in the shortest width (f16/f32/f64) that preserves their value, without needing [`compact_floats`](#compact-float-encoding) separately enabled
+- NaN values are canonicalized to the single half-precision NaN encoding (`0xf97e00`), per RFC 8949 §4.2.2, instead of preserving the input's sign/payload bits
+
+C2PA manifests require this.
+
+Deterministic mode is off by default, since it isn't needed by callers who only care about round-tripping through this crate. Enable it with:
+- `to_vec_deterministic` / `to_writer_deterministic` in place of `to_vec` / `to_writer`
+- `Encoder::new(writer).set_deterministic(true)` when using the low-level API
+- `c2pa_cbor::ser::to_vec_packed`, the `serde_cbor`-compatible alias for `to_vec_deterministic`
 
 
 ## Contributions and feedback

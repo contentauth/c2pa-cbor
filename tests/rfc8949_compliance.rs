@@ -16,26 +16,28 @@
 //!
 //! ## Test Status
 //!
-//! ✅ **ALL TESTS PASSING (11/11 test groups)** - 100% RFC 8949 Compliant!
+//! **ALL TESTS PASSING (11/11 test groups)** - 100% RFC 8949 Compliant!
 //!
-//! Note: These tests require the `compact_floats` feature to pass, as RFC 8949
-//! examples use optimal float encoding (f16/f32/f64 based on precision needed).
+//! Note: the float tests encode via [`c2pa_cbor::Encoder::set_compact_floats`]
+//! rather than plain `to_vec`, since RFC 8949 examples use optimal float
+//! encoding (f16/f32/f64 based on precision needed), which `to_vec` doesn't
+//! apply by default.
 //!
-//! - ✅ Integers (positive and negative)
-//! - ✅ Simple values (bool, null/Option)
-//! - ✅ Floats (with optimal f16/f32/f64 encoding)
-//! - ✅ Text strings (UTF-8 encoded)
-//! - ✅ Byte strings (using serde_bytes::ByteBuf)
-//! - ✅ Arrays (including nested heterogeneous)
-//! - ✅ Maps (with mixed key/value types)
-//! - ✅ Tags (standard CBOR tags 0-5, 21-24, 32-36, 64-87)
-//! - ✅ Newtype structs (transparent serialization - fixed!)
-//! - ✅ Tagged values (proper CBOR tag encoding - fixed!)
-//! - ✅ Value enum roundtrips
+//! - Integers (positive and negative)
+//! - Simple values (bool, null/Option)
+//! - Floats (with optimal f16/f32/f64 encoding)
+//! - Text strings (UTF-8 encoded)
+//! - Byte strings (using serde_bytes::ByteBuf)
+//! - Arrays (including nested heterogeneous)
+//! - Maps (with mixed key/value types)
+//! - Tags (standard CBOR tags 0-5, 21-24, 32-36, 64-87)
+//! - Newtype structs (transparent serialization - fixed!)
+//! - Tagged values (proper CBOR tag encoding - fixed!)
+//! - Value enum roundtrips
 //!
 //! ## Key Features
 //!
-//! - **Optimal Float Encoding** (with `compact_floats` feature): Automatically
+//! - **Optimal Float Encoding** (via `Encoder::set_compact_floats`): Automatically
 //!   uses f16 (2 bytes), f32 (4 bytes), or f64 (8 bytes) based on what's needed
 //!   for lossless representation
 //! - **Proper Tag Support**: Tagged<T> correctly encodes as CBOR major type 6,
@@ -45,9 +47,7 @@
 //! - **Byte String Support**: Use `serde_bytes::ByteBuf` for proper byte string
 //!   encoding (Vec<u8> encodes as arrays by default per serde convention)
 
-#![cfg(feature = "compact_floats")]
-
-use c2pa_cbor::{from_slice, to_vec, value::Value};
+use c2pa_cbor::{Encoder, from_slice, to_vec, value::Value};
 
 /// Test vectors from RFC 8949 Appendix A
 /// Each test specifies the expected hex bytes and decoded value
@@ -88,20 +88,28 @@ fn test_rfc8949_simple_values() {
 
 #[test]
 fn test_rfc8949_floats() {
-    // Test floating point numbers
-    assert_encode_decode(0.0f64, "f90000");
-    assert_encode_decode(-0.0f64, "f98000");
-    assert_encode_decode(1.0f64, "f93c00");
-    assert_encode_decode(1.5f64, "f93e00");
-    assert_encode_decode(65504.0f64, "f97bff");
-    assert_encode_decode(100000.0f64, "fa47c35000");
-    assert_encode_decode(3.4028234663852886e+38f64, "fa7f7fffff");
-    assert_encode_decode(1.0e+300f64, "fb7e37e43c8800759c");
-    assert_encode_decode(-4.1f64, "fbc010666666666666");
+    // RFC 8949's examples use preferred (shortest-form) float encoding,
+    // which plain `to_vec` doesn't apply by default - use
+    // `Encoder::set_compact_floats` instead.
+    assert_encode_decode_compact(0.0f64, "f90000");
+    assert_encode_decode_compact(-0.0f64, "f98000");
+    assert_encode_decode_compact(1.0f64, "f93c00");
+    assert_encode_decode_compact(1.5f64, "f93e00");
+    assert_encode_decode_compact(65504.0f64, "f97bff");
+    assert_encode_decode_compact(100000.0f64, "fa47c35000");
+    assert_encode_decode_compact(3.4028234663852886e+38f64, "fa7f7fffff");
+    assert_encode_decode_compact(1.0e+300f64, "fb7e37e43c8800759c");
+    assert_encode_decode_compact(-4.1f64, "fbc010666666666666");
 
     // Special values
-    assert_eq!(to_vec(&f64::INFINITY).unwrap(), hex_to_bytes("f97c00"));
-    assert_eq!(to_vec(&f64::NEG_INFINITY).unwrap(), hex_to_bytes("f9fc00"));
+    assert_eq!(
+        to_vec_compact_floats(&f64::INFINITY),
+        hex_to_bytes("f97c00")
+    );
+    assert_eq!(
+        to_vec_compact_floats(&f64::NEG_INFINITY),
+        hex_to_bytes("f9fc00")
+    );
 }
 
 #[test]
@@ -300,6 +308,33 @@ where
 
     // Test encoding
     let encoded = to_vec(&value).unwrap();
+    assert_eq!(
+        hex_from_bytes(&encoded),
+        expected_hex,
+        "Encoding mismatch for {:?}",
+        value
+    );
+
+    // Test decoding
+    let decoded: T = from_slice(&expected_bytes).unwrap();
+    assert_eq!(decoded, value, "Decoding mismatch for {}", expected_hex);
+}
+
+fn to_vec_compact_floats<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut encoder = Encoder::new(&mut buf).set_compact_floats(true);
+    encoder.encode(value).unwrap();
+    buf
+}
+
+fn assert_encode_decode_compact<T>(value: T, expected_hex: &str)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+{
+    let expected_bytes = hex_to_bytes(expected_hex);
+
+    // Test encoding
+    let encoded = to_vec_compact_floats(&value);
     assert_eq!(
         hex_from_bytes(&encoded),
         expected_hex,

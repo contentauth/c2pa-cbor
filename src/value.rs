@@ -252,6 +252,21 @@ impl<'de> Deserialize<'de> for Value {
                 }
                 Ok(wrap_tags(Value::Map(map), tags))
             }
+
+            // Only reached when the decoder is in tag-capturing mode (see
+            // `Value::from_tagged_slice`); the tag number was stashed by the
+            // decoder just before this call.
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let tag = crate::tags::take_tag();
+                let inner = deserializer.deserialize_any(self)?;
+                Ok(match tag {
+                    Some(tag) => Value::Tag(tag, Box::new(inner)),
+                    None => inner,
+                })
+            }
         }
 
         deserializer.deserialize_any(ValueVisitor)
@@ -366,6 +381,32 @@ impl Value {
             Value::Tag(tag, value) => Some((*tag, value)),
             _ => None,
         }
+    }
+
+    /// Deserialize CBOR bytes into a `Value`, reconstructing any CBOR tags
+    /// (major type 6) as `Value::Tag` instead of transparently dropping them.
+    ///
+    /// This differs from decoding a `Value` via [`crate::from_slice`], which
+    /// intentionally ignores tags so that plain types (`String`, `i64`, ...)
+    /// can be decoded straight out of tagged CBOR without a wrapper type.
+    /// That transparent behavior is unavailable in this tag-aware mode, so
+    /// it's only offered for `Value` specifically, not as a general decoder
+    /// option.
+    ///
+    /// # Example
+    /// ```
+    /// use c2pa_cbor::{Value, to_vec};
+    ///
+    /// let tagged = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+    /// let bytes = to_vec(&tagged).unwrap();
+    ///
+    /// let decoded = Value::from_tagged_slice(&bytes).unwrap();
+    /// assert_eq!(decoded, tagged);
+    /// ```
+    pub fn from_tagged_slice(bytes: &[u8]) -> crate::Result<Value> {
+        crate::Decoder::from_slice(bytes)
+            .with_capture_tags(true)
+            .decode()
     }
 }
 
@@ -512,7 +553,7 @@ impl Serializer for ValueSerializer {
         if v <= i64::MAX as u64 {
             Ok(Value::Integer(v as i64))
         } else {
-            Err(crate::Error::Message(format!(
+            Err(crate::Error::Encoding(format!(
                 "u64 value {} too large for i64",
                 v
             )))
@@ -566,9 +607,15 @@ impl Serializer for ValueSerializer {
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<Value, crate::Error> {
+        // Check if this is the special CBOR tag marker from Tagged<T>/Value::Tag
+        if name == tags::TAG_MARKER_NAME
+            && let Some(tag) = tags::take_tag()
+        {
+            return Ok(Value::Tag(tag, Box::new(value.serialize(self)?)));
+        }
         value.serialize(self)
     }
 
@@ -726,7 +773,7 @@ impl serde::ser::SerializeMap for SerializeMap {
 
     fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
         let key = self.next_key.take().ok_or_else(|| {
-            crate::Error::Message("serialize_value called before serialize_key".to_string())
+            crate::Error::Encoding("serialize_value called before serialize_key".to_string())
         })?;
         self.map.insert(key, value.serialize(ValueSerializer)?);
         Ok(())
@@ -1284,6 +1331,17 @@ mod tests {
 
         let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_value_tag_round_trips_via_to_value() {
+        // Regression test: ValueSerializer::serialize_newtype_struct ignored
+        // the TAG_MARKER_NAME sentinel, so to_value() silently dropped the
+        // tag even though the binary Encoder (to_vec) handled it correctly.
+        let value = Value::Tag(32, Box::new(Value::Text("https://example.com".to_string())));
+
+        let round_tripped = to_value(value.clone()).unwrap();
+        assert_eq!(round_tripped, value);
     }
 
     #[test]

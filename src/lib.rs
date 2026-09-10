@@ -19,15 +19,26 @@
 //!
 //! ## Architecture
 //!
-//! This library uses a **dual-path serialization strategy** for optimal performance:
+//! - **Arrays**: When the length is known at compile time (the common case), data is
+//!   written directly to the output with zero buffering overhead. Unknown-length
+//!   sequences (e.g., custom iterators) are buffered and written as definite-length
+//!   once the count is known.
+//! - **Maps and structs**: By default, entries preserve source order (struct field
+//!   declaration order, `HashMap` iteration order, etc.) and are written with an
+//!   unbuffered fast path. Use [`crate::to_vec_deterministic`] / [`crate::to_writer_deterministic`]
+//!   or [`Encoder::set_deterministic`] to opt in to buffering entries and writing them
+//!   in the bytewise-lexicographic order of their encoded key bytes (rejecting duplicate
+//!   keys), satisfying RFC 8949 §4.2.1's Core Deterministic Encoding Requirement, which
+//!   C2PA requires for manifests.
+//! - **Floats**: Deterministic mode also applies §4.2.1's preferred-serialization rule
+//!   for floats, writing the shortest width (f16/f32/f64) that preserves the value and
+//!   canonicalizing NaNs to the standard half-precision NaN (`0xf97e00`) per §4.2.2. Use
+//!   [`Encoder::set_compact_floats`] to apply this same shortest-width encoding on the
+//!   non-deterministic fast path as well, without opting into deterministic mode's
+//!   sorted-key buffering.
 //!
-//! - **Fast path**: When collection sizes are known at compile time (the common case),
-//!   data is written directly to the output with zero buffering overhead.
-//! - **Buffering path**: When sizes are unknown (e.g., `#[serde(flatten)]` in `serde_transcode`),
-//!   entries are buffered in memory and written as definite-length once the count is known.
-//!
-//! This design maintains C2PA's requirement for deterministic, definite-length encoding
-//! while supporting the full serde data model including complex features like flatten.
+//! This design supports the full serde data model including complex features like
+//! flatten, while offering opt-in deterministic, definite-length encoding for C2PA.
 //!
 //! ## Features
 //! - Full support for CBOR major types 0-7
@@ -85,7 +96,7 @@ pub mod error;
 pub use error::{Error, Result};
 
 pub mod encoder;
-pub use encoder::{Encoder, to_vec, to_writer};
+pub use encoder::{Encoder, to_vec, to_vec_deterministic, to_writer, to_writer_deterministic};
 
 pub mod decoder;
 // Re-export DOS protection constants for user configuration
@@ -1008,9 +1019,16 @@ mod tests {
         assert_eq!(val3, decoded3);
     }
 
+    fn to_vec_compact<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut encoder = Encoder::new(&mut buf).set_compact_floats(true);
+        encoder.encode(value).unwrap();
+        buf
+    }
+
     #[test]
     fn test_float_serialization() {
-        // Test f32
+        // Test f32 - to_vec keeps the original width by default
         let f32_val = 4.0f32;
         let encoded = to_vec(&f32_val).unwrap();
         println!("f32 encoded: {:?}", encoded);
@@ -1019,7 +1037,13 @@ mod tests {
         let decoded: f32 = from_slice(&encoded).unwrap();
         assert_eq!(f32_val, decoded);
 
-        // Test f64 - behavior depends on compact_floats feature
+        // With compact_floats enabled, 4.0 shrinks losslessly to f16 (FLOAT16 = 25)
+        let encoded_compact = to_vec_compact(&f32_val);
+        assert_eq!(encoded_compact[0], (MAJOR_SIMPLE << 5) | 25);
+        let decoded_compact: f32 = from_slice(&encoded_compact).unwrap();
+        assert_eq!(f32_val, decoded_compact);
+
+        // Test f64 - not losslessly representable in a narrower width either way
         let f64_val = 1.0e+300f64;
         let encoded = to_vec(&f64_val).unwrap();
         println!("f64 encoded: {:?}", encoded);
@@ -1028,24 +1052,22 @@ mod tests {
         let decoded: f64 = from_slice(&encoded).unwrap();
         assert_eq!(f64_val, decoded);
 
-        #[cfg(feature = "compact_floats")]
-        {
-            // With compact_floats enabled, simple values optimize to f16
-            let simple_val = 2.5f64;
-            let encoded_simple = to_vec(&simple_val).unwrap();
-            // Should optimize to f16 (FLOAT16 = 25)
-            assert_eq!(encoded_simple[0], (MAJOR_SIMPLE << 5) | 25);
-            let decoded_simple: f64 = from_slice(&encoded_simple).unwrap();
-            assert_eq!(simple_val, decoded_simple);
-        }
-
-        #[cfg(not(feature = "compact_floats"))]
         {
             // Without compact_floats, all f64 values use full precision
             let simple_val = 2.5f64;
             let encoded_simple = to_vec(&simple_val).unwrap();
             // Should use f64 (FLOAT64 = 27)
             assert_eq!(encoded_simple[0], (MAJOR_SIMPLE << 5) | 27);
+            let decoded_simple: f64 = from_slice(&encoded_simple).unwrap();
+            assert_eq!(simple_val, decoded_simple);
+        }
+
+        {
+            // With compact_floats enabled, simple values optimize to f16
+            let simple_val = 2.5f64;
+            let encoded_simple = to_vec_compact(&simple_val);
+            // Should optimize to f16 (FLOAT16 = 25)
+            assert_eq!(encoded_simple[0], (MAJOR_SIMPLE << 5) | 25);
             let decoded_simple: f64 = from_slice(&encoded_simple).unwrap();
             assert_eq!(simple_val, decoded_simple);
         }
@@ -1620,6 +1642,35 @@ mod tests {
         assert_eq!(decoded, 42);
     }
 
+    #[test]
+    fn test_encoder_to_writer_deterministic() {
+        let mut buf = Vec::new();
+        to_writer_deterministic(&mut buf, &42i32).unwrap();
+        let decoded: i32 = from_slice(&buf).unwrap();
+        assert_eq!(decoded, 42);
+    }
+
+    #[test]
+    fn test_to_writer_deterministic_matches_to_vec_deterministic() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct S {
+            zebra: i32,
+            apple: i32,
+        }
+        let s = S { zebra: 1, apple: 2 };
+
+        let mut buf = Vec::new();
+        to_writer_deterministic(&mut buf, &s).unwrap();
+
+        // Same sorted-key output as the Vec-returning entry point, and
+        // different from declaration-order `to_writer`.
+        assert_eq!(buf, to_vec_deterministic(&s).unwrap());
+        assert_ne!(buf, to_vec(&s).unwrap());
+
+        let decoded: S = from_slice(&buf).unwrap();
+        assert_eq!(decoded, s);
+    }
+
     // ============================================================================
     // Comprehensive Deserialization Coverage Tests
     // ============================================================================
@@ -1676,6 +1727,31 @@ mod tests {
         cbor.push(0x00); // integer 0
         // Close all arrays
         cbor.extend(std::iter::repeat_n(0xff, 151));
+
+        let mut decoder = Decoder::new(Cursor::new(&cbor[..]));
+        let result: Result<Value> = decoder.decode();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("nesting depth") || err_msg.contains("recursion"),
+            "Expected recursion depth error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_decode_tag_chain_recursion_depth_limit() {
+        use std::io::Cursor;
+
+        use crate::decoder::Decoder;
+
+        // A chain of nested tags (e.g. repeated 0xc0 bytes) recurses through
+        // the same MAJOR_TAG decoding path on each tag, just like nested
+        // arrays/maps recurse on each level - it must be bounded by the same
+        // recursion-depth guard, or a long enough chain would overflow the
+        // stack instead of returning a decode error.
+        let mut cbor = vec![0xc0; 150]; // 150 nested tag(0, ...) wrappers (exceeds DEFAULT_MAX_DEPTH of 128)
+        cbor.push(0x00); // innermost value: integer 0
 
         let mut decoder = Decoder::new(Cursor::new(&cbor[..]));
         let result: Result<Value> = decoder.decode();

@@ -32,11 +32,11 @@ pub use crate::to_writer;
 
 /// Serialize to Vec with packed/canonical encoding (definite-length only)
 ///
-/// Note: This is currently identical to [`to_vec`] since we always produce
-/// deterministic, definite-length CBOR output.
+/// This is an alias for [`crate::to_vec_deterministic`], matching
+/// serde_cbor's canonical (sorted-key) output.
 #[inline]
 pub fn to_vec_packed<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
-    crate::to_vec(value)
+    crate::to_vec_deterministic(value)
 }
 
 /// A serializer for CBOR encoding

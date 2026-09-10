@@ -26,6 +26,12 @@ pub struct Decoder<R: Read> {
     recursion_depth: usize,
     max_recursion_depth: usize,
     current_tag: Option<u64>,
+    /// When true, `deserialize_any_impl` notifies the visitor of a CBOR tag
+    /// via `visit_newtype_struct` instead of transparently skipping past it.
+    /// Only safe for a visitor that implements `visit_newtype_struct` (e.g.
+    /// `Value`'s); see [`crate::Value::from_tagged_slice`]. Left `false` by
+    /// default so plain types keep deserializing straight out of tagged CBOR.
+    capture_tags: bool,
 }
 
 /// Safely convert u64 to usize, checking for overflow on 32-bit platforms
@@ -64,7 +70,17 @@ impl<R: Read> Decoder<R> {
             recursion_depth: 0,
             max_recursion_depth: DEFAULT_MAX_DEPTH,
             current_tag: None,
+            capture_tags: false,
         }
+    }
+
+    /// Enable tag-capturing mode (builder pattern): notify the visitor of
+    /// CBOR tags via `visit_newtype_struct` instead of transparently
+    /// skipping past them. Only used internally by
+    /// [`crate::Value::from_tagged_slice`].
+    pub(crate) fn with_capture_tags(mut self, capture: bool) -> Self {
+        self.capture_tags = capture;
+        self
     }
 
     /// Set the maximum allocation size for a single CBOR value (builder pattern)
@@ -400,10 +416,16 @@ impl<R: Read> Decoder<R> {
                 // on drop (even on panic) so it can't leak into an unrelated
                 // later decode.
                 let _guard = tags::TagGuard::new(tag);
+                // A chain of nested tags (e.g. repeated 0xc0 bytes) recurses
+                // here just like nested arrays/maps do, so it needs the same
+                // depth guard to bound stack usage against malicious input.
+                self.check_recursion_depth()?;
+                self.recursion_depth += 1;
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self, tag },
                     visitor,
                 );
+                // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
 
                 // Clear the tag after deserialization
                 self.current_tag = None;
@@ -559,7 +581,10 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
                 .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
 
             self.current_tag = Some(tag);
+            self.check_recursion_depth()?;
+            self.recursion_depth += 1;
             let result = TaggedValueDeserializer { de: &mut self, tag }.deserialize_map(visitor);
+            // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
             self.current_tag = None;
             result
         } else {
@@ -665,7 +690,10 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
                 .ok_or_else(|| Error::Syntax("Tag cannot be indefinite".to_string()))?;
 
             self.current_tag = Some(tag);
+            self.check_recursion_depth()?;
+            self.recursion_depth += 1;
             let result = TaggedValueDeserializer { de: self, tag }.deserialize_map(visitor);
+            // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
             self.current_tag = None;
             result
         } else {
@@ -808,10 +836,13 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 // so a tag-aware visitor like `Value`'s can reconstruct it;
                 // see the comment there.
                 let _guard = tags::TagGuard::new(tag);
+                self.de.check_recursion_depth()?;
+                self.de.recursion_depth += 1;
                 let result = serde::Deserializer::deserialize_any(
                     TaggedValueDeserializer { de: self.de, tag },
                     visitor,
                 );
+                // Note: recursion_depth is decremented in TaggedValueDeserializer::drop
 
                 // Clear the tag after deserialization
                 self.de.current_tag = None;
@@ -1028,6 +1059,16 @@ impl<'de, 'a, R: Read> serde::de::MapAccess<'de> for MapAccess<'a, R> {
 struct TaggedValueDeserializer<'a, R: Read> {
     de: &'a mut Decoder<R>,
     tag: u64,
+}
+
+// Every construction site increments `recursion_depth` (after checking the
+// limit) right before building one of these; this pairs it with a decrement
+// so a chain of nested tags is bounded the same way nested arrays/maps are,
+// instead of recursing without limit.
+impl<'a, R: Read> Drop for TaggedValueDeserializer<'a, R> {
+    fn drop(&mut self) {
+        self.de.recursion_depth = self.de.recursion_depth.saturating_sub(1);
+    }
 }
 
 impl<'de, 'a, R: Read> serde::Deserializer<'de> for TaggedValueDeserializer<'a, R> {
@@ -1301,4 +1342,155 @@ pub fn from_slice_with_limit<'de, T: Deserialize<'de>>(
     }
 
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde::Serialize;
+
+    use super::*;
+    use crate::{Value, from_slice, to_vec};
+
+    // ===== deserialize_option =====
+    // `Option<T>` routes through `deserialize_option`, which reads the leading
+    // byte itself and then hands the rest to `PrefetchedDeserializer` (scalars,
+    // tags), `ArrayDeserializer`, or `MapDeserializer`. These cover the arms
+    // the existing Some/None round-trip tests don't reach.
+
+    #[test]
+    fn option_null_is_none() {
+        // 0xf6 is the one byte `deserialize_option` handles directly.
+        let decoded: Option<u32> = from_slice(&[0xf6]).unwrap();
+        assert_eq!(decoded, None);
+    }
+
+    #[test]
+    fn option_some_negative_integer() {
+        // PrefetchedDeserializer, MAJOR_NEGATIVE arm: 0x20 == -1.
+        let decoded: Option<i32> = from_slice(&[0x20]).unwrap();
+        assert_eq!(decoded, Some(-1));
+    }
+
+    #[test]
+    fn option_some_float16() {
+        // PrefetchedDeserializer, FLOAT16 arm: 0xf93c00 == 1.0 in half precision.
+        let decoded: Option<f32> = from_slice(&[0xf9, 0x3c, 0x00]).unwrap();
+        assert_eq!(decoded, Some(1.0));
+    }
+
+    #[test]
+    fn option_some_float64() {
+        // PrefetchedDeserializer, FLOAT64 arm.
+        let encoded = to_vec(&Some(2.5f64)).unwrap();
+        let decoded: Option<f64> = from_slice(&encoded).unwrap();
+        assert_eq!(decoded, Some(2.5));
+    }
+
+    #[test]
+    fn option_some_indefinite_array() {
+        // MAJOR_ARRAY with indefinite length -> ArrayDeserializer { remaining: None }.
+        let decoded: Option<Vec<u32>> = from_slice(&[0x9f, 0x01, 0x02, 0xff]).unwrap();
+        assert_eq!(decoded, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn option_some_indefinite_map() {
+        // MAJOR_MAP with indefinite length -> MapDeserializer { remaining: None }.
+        let decoded: Option<BTreeMap<String, u32>> =
+            from_slice(&[0xbf, 0x61, 0x61, 0x01, 0xff]).unwrap();
+        assert_eq!(decoded, Some(BTreeMap::from([("a".to_string(), 1)])));
+    }
+
+    #[test]
+    fn option_some_tag_is_transparent() {
+        // PrefetchedDeserializer, MAJOR_TAG arm: the tag is consumed transparently
+        // and the inner value decodes as if untagged. Bytes: tag(0) + "hi".
+        let decoded: Option<String> = from_slice(&[0xc0, 0x62, b'h', b'i']).unwrap();
+        assert_eq!(decoded, Some("hi".to_string()));
+    }
+
+    // ===== deserialize_enum =====
+    // `deserialize_enum_impl` only accepts a text string (unit variant) or a
+    // single-entry map (variant with data); the happy paths are covered in
+    // lib.rs. These exercise its rejection arms, including the MAJOR_TAG hole.
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    enum SampleEnum {
+        VariantA,
+        Value(u32),
+    }
+
+    #[test]
+    fn enum_wrapped_in_tag_is_rejected() {
+        // KNOWN HOLE: `deserialize_enum` does not unwrap a leading CBOR tag, so a
+        // tagged enum encoding is rejected rather than transparently decoded the
+        // way `deserialize_any` handles tags. Documented here, not (yet) fixed.
+        let mut bytes = to_vec(&SampleEnum::VariantA).unwrap(); // 0x68 "VariantA"
+        bytes.insert(0, 0xc0); // prepend tag(0)
+        assert!(from_slice::<SampleEnum>(&bytes).is_err());
+    }
+
+    #[test]
+    fn enum_from_multi_entry_map_is_rejected() {
+        // A variant-with-data map must have exactly one entry; a two-entry map
+        // is not a valid enum encoding.
+        let bytes = [0xa2, 0x61, 0x41, 0x01, 0x61, 0x42, 0x02]; // {"A":1,"B":2}
+        assert!(from_slice::<SampleEnum>(&bytes).is_err());
+    }
+
+    #[test]
+    fn enum_from_indefinite_text_is_rejected() {
+        // An indefinite-length text string cannot name a variant.
+        assert!(from_slice::<SampleEnum>(&[0x7f]).is_err());
+    }
+
+    // ===== deserialize_map =====
+
+    #[test]
+    fn map_without_tag_decodes_normally() {
+        // Untagged map takes the else-branch straight into deserialize_any_impl.
+        let decoded: BTreeMap<String, u32> = from_slice(&[0xa1, 0x61, 0x61, 0x05]).unwrap();
+        assert_eq!(decoded, BTreeMap::from([("a".to_string(), 5)]));
+    }
+
+    #[test]
+    fn tagged_map_projects_to_virtual_tag_value_map() {
+        // MAJOR_TAG branch of `deserialize_map`: a tagged value decoded via
+        // deserialize_map is projected into a synthetic {"tag", "value"} map
+        // (the mechanism behind `Tagged<T>`). Bytes: tag(1) wrapping 5.
+        let decoded: BTreeMap<String, Value> = from_slice(&[0xc1, 0x05]).unwrap();
+        assert_eq!(
+            decoded,
+            BTreeMap::from([
+                ("tag".to_string(), Value::Integer(1)),
+                ("value".to_string(), Value::Integer(5)),
+            ])
+        );
+    }
+
+    // ===== deserialize_any =====
+    // Decoding into `Value` exercises `deserialize_any_impl` directly.
+
+    #[test]
+    fn any_rejects_indefinite_negative_integer() {
+        // MAJOR_NEGATIVE cannot carry an indefinite-length marker.
+        assert!(from_slice::<Value>(&[0x3f]).is_err());
+    }
+
+    #[test]
+    fn any_decodes_undefined_as_null() {
+        // MAJOR_SIMPLE / UNDEFINED (0xf7) visits unit, which Value maps to Null.
+        assert_eq!(from_slice::<Value>(&[0xf7]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn any_decodes_float16_into_value() {
+        // MAJOR_SIMPLE / FLOAT16 widens to f32 then into Value::Float.
+        assert_eq!(
+            from_slice::<Value>(&[0xf9, 0x3c, 0x00]).unwrap(),
+            Value::Float(1.0)
+        );
+    }
 }
