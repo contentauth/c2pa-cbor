@@ -45,6 +45,21 @@ fn u64_to_usize(val: u64) -> Result<usize> {
     })
 }
 
+/// Hand a CBOR negative integer to `visitor`. Major type 1 encodes the value
+/// `-1 - val`, which ranges down to `-2^64` (when `val == u64::MAX`) - wider
+/// than `i64` can hold. Values in `i64` range use `visit_i64`; the rest use
+/// `visit_i128` (their magnitude always fits `i128`) so an `i128` target
+/// decodes correctly and any narrower target gets a clean "invalid type" error
+/// instead of the silently wrapped-around `i64` that `-1 - val as i64` produced.
+#[inline]
+fn visit_negative<'de, V: serde::de::Visitor<'de>>(visitor: V, val: u64) -> Result<V::Value> {
+    if val <= i64::MAX as u64 {
+        visitor.visit_i64(-1 - val as i64)
+    } else {
+        visitor.visit_i128(-1i128 - val as i128)
+    }
+}
+
 impl<R: Read> Decoder<R> {
     /// Create a new CBOR decoder with default limits
     ///
@@ -135,12 +150,13 @@ impl<R: Read> Decoder<R> {
         Ok(())
     }
 
-    /// Try to allocate a buffer of the given size
+    /// Reject a claimed length that exceeds the configured allocation limit.
     ///
-    /// This checks the configured maximum first, then uses try_reserve to
-    /// respect actual system memory limits (ulimit, Docker, cgroups, etc.)
-    fn try_allocate(&self, size: usize) -> Result<Vec<u8>> {
-        // Check user-defined limit first (if set)
+    /// This only validates the limit against the *claimed* size - it never
+    /// allocates that many bytes up front. Callers read incrementally and let
+    /// the buffer grow to the data that actually arrives, so a tiny input
+    /// claiming a huge length can't force a large eager allocation.
+    fn check_alloc_limit(&self, size: usize) -> Result<()> {
         if let Some(max) = self.max_allocation
             && size > max
         {
@@ -149,14 +165,7 @@ impl<R: Read> Decoder<R> {
                 size, max
             )));
         }
-
-        // Try to actually allocate - respects system limits
-        let mut buf = Vec::new();
-        buf.try_reserve(size).map_err(|_| {
-            Error::Syntax(format!("Cannot allocate {} bytes (out of memory)", size))
-        })?;
-        buf.resize(size, 0);
-        Ok(buf)
+        Ok(())
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -221,11 +230,26 @@ impl<R: Read> Decoder<R> {
         Ok(())
     }
 
-    /// Read a definite-length byte buffer
+    /// Read a definite-length byte buffer.
+    ///
+    /// Enforces the allocation limit against the *claimed* length, then reads
+    /// incrementally via `take`/`read_to_end` so the buffer only grows to the
+    /// bytes that actually arrive. A lying length - a tiny input claiming a
+    /// huge string - therefore can't trigger a `len`-sized eager alloc-and-zero
+    /// before the read; it just fails with `Eof` once the stream ends short.
     #[inline]
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
-        let mut buf = self.try_allocate(len)?;
-        self.reader.read_exact(&mut buf)?;
+        self.check_alloc_limit(len)?;
+
+        let mut buf = Vec::new();
+        let read = self
+            .reader
+            .by_ref()
+            .take(len as u64)
+            .read_to_end(&mut buf)?;
+        if read != len {
+            return Err(Error::Eof);
+        }
         Ok(buf)
     }
 
@@ -352,7 +376,7 @@ impl<R: Read> Decoder<R> {
                 let val = self.read_length(info)?.ok_or_else(|| {
                     Error::Syntax("Negative integer cannot be indefinite".to_string())
                 })?;
-                visitor.visit_i64(-1 - val as i64)
+                visit_negative(visitor, val)
             }
             MAJOR_BYTES => match self.read_length(info)? {
                 Some(len) => {
@@ -504,7 +528,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for Decoder<R> {
     type Error = crate::Error;
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf unit unit_struct newtype_struct seq tuple
         tuple_struct struct identifier ignored_any
     }
@@ -598,7 +622,7 @@ impl<'de, R: Read> serde::Deserializer<'de> for &mut Decoder<R> {
     type Error = crate::Error;
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf unit unit_struct seq tuple
         tuple_struct struct identifier ignored_any
     }
@@ -713,7 +737,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for MapDeserializer<'a, R> {
     type Error = crate::Error;
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
         tuple_struct map struct enum identifier ignored_any
     }
@@ -735,7 +759,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for ArrayDeserializer<'a, R> {
     type Error = crate::Error;
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
         tuple_struct map struct enum identifier ignored_any
     }
@@ -758,7 +782,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
     type Error = crate::Error;
 
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
         tuple_struct map struct enum identifier ignored_any
     }
@@ -775,7 +799,7 @@ impl<'de, 'a, R: Read> serde::Deserializer<'de> for PrefetchedDeserializer<'a, R
                 let val = self.de.read_length(self.info)?.ok_or_else(|| {
                     Error::Syntax("Negative integer cannot be indefinite".to_string())
                 })?;
-                visitor.visit_i64(-1 - val as i64)
+                visit_negative(visitor, val)
             }
             MAJOR_TEXT => {
                 let len = self.de.read_length(self.info)?.ok_or_else(|| {
@@ -1351,7 +1375,7 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
-    use crate::{Value, from_slice, to_vec};
+    use crate::{Value, from_slice, from_slice_with_limit, to_vec};
 
     // ===== deserialize_option =====
     // `Option<T>` routes through `deserialize_option`, which reads the leading
@@ -1491,6 +1515,132 @@ mod tests {
         assert_eq!(
             from_slice::<Value>(&[0xf9, 0x3c, 0x00]).unwrap(),
             Value::Float(1.0)
+        );
+    }
+
+    // ===== negative integers below i64::MIN (regression) =====
+    // CBOR major type 1 ranges down to -2^64. The old `-1 - val as i64` silently
+    // wrapped anything past i64::MIN (e.g. -2^64 decoded to 0). They now route
+    // through visit_i128: correct for i128 targets, a clean error for narrower ones.
+
+    // 0x3b + eight 0xff bytes == -1 - u64::MAX == -2^64.
+    const NEG_2_POW_64: [u8; 9] = [0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+
+    #[test]
+    fn negative_below_i64_min_decodes_into_i128() {
+        let decoded: i128 = from_slice(&NEG_2_POW_64).unwrap();
+        assert_eq!(decoded, -(1i128 << 64));
+    }
+
+    #[test]
+    fn negative_below_i64_min_errors_for_i64_target() {
+        // A clean "invalid type" error, not a silently wrapped value.
+        assert!(from_slice::<i64>(&NEG_2_POW_64).is_err());
+    }
+
+    #[test]
+    fn negative_below_i64_min_decodes_into_value() {
+        // Regression: this used to silently decode to Value::Integer(0). Now
+        // that Value::Integer is i128, -2^64 is represented faithfully.
+        assert_eq!(
+            from_slice::<Value>(&NEG_2_POW_64).unwrap(),
+            Value::Integer(-(1i128 << 64))
+        );
+    }
+
+    #[test]
+    fn negative_just_below_i64_min_decodes_into_i128() {
+        // n == i64::MIN - 1; payload val == 2^63, one past the i64 cutoff.
+        let bytes = [0x3b, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let decoded: i128 = from_slice(&bytes).unwrap();
+        assert_eq!(decoded, i64::MIN as i128 - 1);
+    }
+
+    #[test]
+    fn i64_min_still_round_trips() {
+        // Boundary: i64::MIN's payload is i64::MAX, still on the visit_i64 path.
+        let bytes = to_vec(&i64::MIN).unwrap();
+        assert_eq!(from_slice::<i64>(&bytes).unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn u64_above_i64_max_decodes_into_u128() {
+        // MAJOR_UNSIGNED already carried the full u64; a u128 target now reaches it.
+        let bytes = to_vec(&u64::MAX).unwrap();
+        assert_eq!(from_slice::<u128>(&bytes).unwrap(), u64::MAX as u128);
+    }
+
+    // ===== read_bytes DoS hardening =====
+    // read_bytes no longer eagerly allocates (and zeroes) the *claimed* length
+    // before reading; it reads incrementally so a lying length can't force a
+    // large allocation from a tiny input.
+
+    #[test]
+    fn byte_string_reads_full_body() {
+        // Sanity: a well-formed definite-length byte string still decodes fully.
+        let value = Value::Bytes(vec![1, 2, 3, 4, 5]);
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(from_slice::<Value>(&bytes).unwrap(), value);
+    }
+
+    #[test]
+    fn byte_string_truncated_body_errors() {
+        // Header claims 1000 bytes; only 3 follow -> clean error, not a hang or
+        // a 1000-byte allocation.
+        let mut bytes = vec![0x59, 0x03, 0xe8]; // byte string, u16 length = 1000
+        bytes.extend_from_slice(&[1, 2, 3]);
+        assert!(from_slice::<Value>(&bytes).is_err());
+    }
+
+    #[test]
+    fn byte_string_over_allocation_limit_is_rejected() {
+        // Claimed length above the allocation limit is rejected up front,
+        // before any read.
+        let bytes = [0x5a, 0x00, 0x10, 0x00, 0x00, 0x00]; // byte string, u32 length = 1 MiB
+        let err = from_slice_with_limit::<Value>(&bytes, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn read_bytes_does_not_preallocate_claimed_length() {
+        use std::{cell::Cell, io::Read};
+
+        // Records the largest buffer the reader is ever asked to fill. The old
+        // read_bytes handed read_exact a full `len`-sized buffer up front; the
+        // new one only grows to the bytes that actually arrive.
+        struct RecordingReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            max_buf: &'a Cell<usize>,
+        }
+        impl Read for RecordingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.max_buf.set(self.max_buf.get().max(buf.len()));
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        // Byte string header claiming 1 MiB, but only 8 bytes of body follow.
+        let mut data = vec![0x5a, 0x00, 0x10, 0x00, 0x00]; // byte string, u32 length = 1 MiB
+        data.extend_from_slice(&[0u8; 8]);
+
+        let max_buf = Cell::new(0usize);
+        let reader = RecordingReader {
+            data: &data,
+            pos: 0,
+            max_buf: &max_buf,
+        };
+        let mut decoder = Decoder::new(reader);
+        let result: Result<Value> = decoder.decode();
+
+        assert!(result.is_err()); // truncated body -> Eof
+        assert!(
+            max_buf.get() < 100_000,
+            "read_bytes handed the reader a {}-byte buffer; it must not pre-size to the claimed length",
+            max_buf.get()
         );
     }
 }

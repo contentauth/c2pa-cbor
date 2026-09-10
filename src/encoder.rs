@@ -228,6 +228,30 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
         }
     }
 
+    fn serialize_i128(self, v: i128) -> Result<()> {
+        // CBOR major types 0/1 cover -2^64 ..= 2^64-1. Values inside that range
+        // encode as a normal (un)signed integer; anything beyond would require a
+        // bignum (tag 2/3), which this crate does not emit.
+        if v >= 0 {
+            match u64::try_from(v) {
+                Ok(u) => self.write_type_value(MAJOR_UNSIGNED, u),
+                Err(_) => Err(Error::Encoding(format!(
+                    "i128 value {} exceeds CBOR integer range (bignum not supported)",
+                    v
+                ))),
+            }
+        } else {
+            // Major type 1 encodes -1 - v; it fits u64 exactly when v >= -2^64.
+            match u64::try_from(-1 - v) {
+                Ok(payload) => self.write_type_value(MAJOR_NEGATIVE, payload),
+                Err(_) => Err(Error::Encoding(format!(
+                    "i128 value {} exceeds CBOR integer range (bignum not supported)",
+                    v
+                ))),
+            }
+        }
+    }
+
     fn serialize_u8(self, v: u8) -> Result<()> {
         self.serialize_u64(v as u64)
     }
@@ -242,6 +266,16 @@ impl<'a, W: Write> serde::Serializer for &'a mut Encoder<W> {
 
     fn serialize_u64(self, v: u64) -> Result<()> {
         self.write_type_value(MAJOR_UNSIGNED, v)
+    }
+
+    fn serialize_u128(self, v: u128) -> Result<()> {
+        match u64::try_from(v) {
+            Ok(u) => self.write_type_value(MAJOR_UNSIGNED, u),
+            Err(_) => Err(Error::Encoding(format!(
+                "u128 value {} exceeds CBOR integer range (bignum not supported)",
+                v
+            ))),
+        }
     }
 
     fn serialize_f32(self, v: f32) -> Result<()> {
