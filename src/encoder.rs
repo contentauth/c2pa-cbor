@@ -824,3 +824,224 @@ pub fn to_writer_deterministic<W: Write, T: Serialize>(writer: W, value: &T) -> 
     encoder.encode(value)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::{Serialize, Serializer, ser::SerializeSeq};
+
+    use super::*;
+    use crate::from_slice;
+
+    /// Encode a single float through the private shortest-width helper.
+    fn compact_bytes(v: f64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.write_compact_float(v).unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn compact_float_picks_half_for_small_exact_values() {
+        // Values exactly representable in half precision use FLOAT16 (0xf9) + 2 bytes.
+        assert_eq!(compact_bytes(0.0), vec![0xf9, 0x00, 0x00]);
+        assert_eq!(compact_bytes(-0.0), vec![0xf9, 0x80, 0x00]);
+        assert_eq!(compact_bytes(1.0), vec![0xf9, 0x3c, 0x00]);
+        assert_eq!(compact_bytes(1.5), vec![0xf9, 0x3e, 0x00]);
+        // 65504 is the largest finite half-precision value.
+        assert_eq!(compact_bytes(65504.0), vec![0xf9, 0x7b, 0xff]);
+    }
+
+    #[test]
+    fn compact_float_encodes_infinities_as_half() {
+        assert_eq!(compact_bytes(f64::INFINITY), vec![0xf9, 0x7c, 0x00]);
+        assert_eq!(compact_bytes(f64::NEG_INFINITY), vec![0xf9, 0xfc, 0x00]);
+    }
+
+    #[test]
+    fn compact_float_canonicalizes_every_nan_to_one_encoding() {
+        let canonical = vec![0xf9, 0x7e, 0x00];
+        assert_eq!(compact_bytes(f64::NAN), canonical);
+        // Negative NaN, a quiet NaN with a payload, and a signaling NaN must
+        // all collapse to the same bytes (RFC 8949 §4.2.2).
+        assert_eq!(
+            compact_bytes(f64::from_bits(0xfff8_0000_0000_0000)),
+            canonical
+        );
+        assert_eq!(
+            compact_bytes(f64::from_bits(0x7ff8_0000_0000_0001)),
+            canonical
+        );
+        assert_eq!(
+            compact_bytes(f64::from_bits(0x7ff0_0000_0000_0001)),
+            canonical
+        );
+    }
+
+    #[test]
+    fn compact_float_falls_back_to_single_when_half_is_lossy() {
+        // Out of half's range but exactly representable as f32.
+        let v = 100_000.0_f64;
+        let mut expected = vec![0xfa];
+        expected.extend_from_slice(&(v as f32).to_be_bytes());
+        assert_eq!(compact_bytes(v), expected);
+        assert_eq!(compact_bytes(v).len(), 5);
+    }
+
+    #[test]
+    fn compact_float_falls_back_to_double_when_single_is_lossy() {
+        // 0.1 is not exactly representable in half or single precision.
+        let v = 0.1_f64;
+        let mut expected = vec![0xfb];
+        expected.extend_from_slice(&v.to_be_bytes());
+        assert_eq!(compact_bytes(v), expected);
+        assert_eq!(compact_bytes(v).len(), 9);
+    }
+
+    #[test]
+    fn serialize_f64_stays_full_width_unless_asked() {
+        // Plain to_vec is neither deterministic nor compact: full FLOAT64.
+        let mut expected = vec![0xfb];
+        expected.extend_from_slice(&1.5f64.to_be_bytes());
+        assert_eq!(to_vec(&1.5f64).unwrap(), expected);
+    }
+
+    #[test]
+    fn serialize_f64_compacts_in_deterministic_mode() {
+        assert_eq!(
+            to_vec_deterministic(&1.5f64).unwrap(),
+            vec![0xf9, 0x3e, 0x00]
+        );
+    }
+
+    #[test]
+    fn serialize_f32_compacts_when_flag_set() {
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf).set_compact_floats(true);
+            enc.encode(&1.5f32).unwrap();
+        }
+        assert_eq!(buf, vec![0xf9, 0x3e, 0x00]);
+    }
+
+    #[test]
+    fn serialize_f32_compact_keeps_single_width_when_needed() {
+        // 0.1f32 widened to f64 is still exactly f32-representable, so the
+        // shortest lossless width is f32, not f64.
+        let v = 0.1_f32;
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf).set_compact_floats(true);
+            enc.encode(&v).unwrap();
+        }
+        let mut expected = vec![0xfa];
+        expected.extend_from_slice(&v.to_be_bytes());
+        assert_eq!(buf, expected);
+    }
+
+    /// A `Serialize` wrapper that reports no length hint, forcing the encoder
+    /// down the buffering path (`SerializeVec::Array` + `serialize_to_buffer`)
+    /// instead of the direct fast path.
+    struct UnknownLenSeq<T>(Vec<T>);
+
+    impl<T: Serialize> Serialize for UnknownLenSeq<T> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+            let mut seq = serializer.serialize_seq(None)?;
+            for item in &self.0 {
+                seq.serialize_element(item)?;
+            }
+            seq.end()
+        }
+    }
+
+    #[test]
+    fn buffered_seq_matches_known_length_and_round_trips() {
+        let items = vec![1i64, 2, 3];
+        let buffered = to_vec(&UnknownLenSeq(items.clone())).unwrap();
+
+        // Buffering resolves to the same definite-length encoding a known
+        // length would have produced.
+        assert_eq!(buffered, to_vec(&items).unwrap());
+        // Definite-length 3-element array header, not indefinite.
+        assert_eq!(buffered[0], (MAJOR_ARRAY << 5) | 3);
+
+        let decoded: Vec<i64> = from_slice(&buffered).unwrap();
+        assert_eq!(decoded, items);
+    }
+
+    #[test]
+    fn buffered_seq_inherits_compact_floats() {
+        // serialize_to_buffer must thread the outer encoder's compact_floats
+        // flag into each buffered element.
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf).set_compact_floats(true);
+            enc.encode(&UnknownLenSeq(vec![1.5f64])).unwrap();
+        }
+        // 1-element array, then a half-precision 1.5.
+        assert_eq!(buf, vec![(MAJOR_ARRAY << 5) | 1, 0xf9, 0x3e, 0x00]);
+    }
+
+    #[test]
+    fn buffered_seq_inherits_deterministic_key_sorting() {
+        #[derive(Serialize)]
+        struct Inner {
+            b: u8,
+            a: u8,
+        }
+
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf).set_deterministic(true);
+            enc.encode(&UnknownLenSeq(vec![Inner { b: 2, a: 1 }]))
+                .unwrap();
+        }
+        // Outer array(1); the buffered inner map has its keys sorted so "a"
+        // (0x6161) precedes "b" (0x6162) despite the field declaration order.
+        assert_eq!(
+            buf,
+            vec![
+                (MAJOR_ARRAY << 5) | 1, // array(1)
+                (MAJOR_MAP << 5) | 2,   // map(2)
+                0x61,
+                0x61,
+                0x01, // "a": 1
+                0x61,
+                0x62,
+                0x02, // "b": 2
+            ]
+        );
+    }
+
+    #[test]
+    fn buffered_seq_without_deterministic_keeps_insertion_order() {
+        #[derive(Serialize)]
+        struct Inner {
+            b: u8,
+            a: u8,
+        }
+
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.encode(&UnknownLenSeq(vec![Inner { b: 2, a: 1 }]))
+                .unwrap();
+        }
+        // Without deterministic mode the buffered element keeps declaration
+        // order: "b" before "a".
+        assert_eq!(
+            buf,
+            vec![
+                (MAJOR_ARRAY << 5) | 1, // array(1)
+                (MAJOR_MAP << 5) | 2,   // map(2)
+                0x61,
+                0x62,
+                0x02, // "b": 2
+                0x61,
+                0x61,
+                0x01, // "a": 1
+            ]
+        );
+    }
+}
