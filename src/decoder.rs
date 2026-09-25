@@ -232,16 +232,26 @@ impl<R: Read> Decoder<R> {
 
     /// Read a definite-length byte buffer.
     ///
-    /// Enforces the allocation limit against the *claimed* length, then reads
-    /// incrementally via `take`/`read_to_end` so the buffer only grows to the
-    /// bytes that actually arrive. A lying length - a tiny input claiming a
-    /// huge string - therefore can't trigger a `len`-sized eager alloc-and-zero
-    /// before the read; it just fails with `Eof` once the stream ends short.
+    /// Enforces the allocation limit against the *claimed* length, reserves a
+    /// bounded chunk up front, then reads via `take`/`read_to_end` so the
+    /// buffer grows to the bytes that actually arrive. The up-front reserve is
+    /// capped and never zero-filled, so a lying length - a tiny input claiming
+    /// a huge string - can't force a large eager allocation; it just fails with
+    /// `Eof` once the stream ends short. The reserve lets a normal-sized value
+    /// be read in a single pass instead of `read_to_end`'s grow-by-doubling.
     #[inline]
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
         self.check_alloc_limit(len)?;
 
+        // Cap the eager reserve: large claims grow incrementally as real data
+        // arrives, bounding what an unverified length can allocate up front.
+        const EAGER_RESERVE_CAP: usize = 64 * 1024;
+        let reserve = len.min(EAGER_RESERVE_CAP);
         let mut buf = Vec::new();
+        buf.try_reserve(reserve).map_err(|_| {
+            Error::Syntax(format!("Cannot allocate {} bytes (out of memory)", reserve))
+        })?;
+
         let read = self
             .reader
             .by_ref()
@@ -1607,7 +1617,8 @@ mod tests {
 
         // Records the largest buffer the reader is ever asked to fill. The old
         // read_bytes handed read_exact a full `len`-sized buffer up front; the
-        // new one only grows to the bytes that actually arrive.
+        // new one reserves only a bounded chunk and grows to the bytes that
+        // actually arrive.
         struct RecordingReader<'a> {
             data: &'a [u8],
             pos: usize,
@@ -1623,8 +1634,8 @@ mod tests {
             }
         }
 
-        // Byte string header claiming 1 MiB, but only 8 bytes of body follow.
-        let mut data = vec![0x5a, 0x00, 0x10, 0x00, 0x00]; // byte string, u32 length = 1 MiB
+        // Byte string header claiming 16 MiB, but only 8 bytes of body follow.
+        let mut data = vec![0x5a, 0x01, 0x00, 0x00, 0x00]; // byte string, u32 length = 16 MiB
         data.extend_from_slice(&[0u8; 8]);
 
         let max_buf = Cell::new(0usize);
@@ -1637,9 +1648,11 @@ mod tests {
         let result: Result<Value> = decoder.decode();
 
         assert!(result.is_err()); // truncated body -> Eof
+        // The reader is asked for at most the bounded reserve (64 KiB), never
+        // anything close to the 16 MiB claimed length.
         assert!(
-            max_buf.get() < 100_000,
-            "read_bytes handed the reader a {}-byte buffer; it must not pre-size to the claimed length",
+            max_buf.get() <= 128 * 1024,
+            "read_bytes handed the reader a {}-byte buffer; it must stay bounded by the reserve cap, not the claimed length",
             max_buf.get()
         );
     }
