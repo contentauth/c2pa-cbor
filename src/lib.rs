@@ -111,6 +111,9 @@ pub use value::{Value, from_value, to_value};
 pub mod tags;
 pub use tags::*;
 
+#[cfg(feature = "cose")]
+pub mod cose;
+
 /// Serialization module for compatibility with serde_cbor
 pub mod ser;
 
