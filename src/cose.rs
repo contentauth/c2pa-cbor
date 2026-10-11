@@ -16,16 +16,21 @@
 //! COSE implementation - it covers only `COSE_Sign1` (no `CoseSign`, `CoseEncrypt`,
 //! `CoseMac`, or key structures) and only the header shapes C2PA needs
 //! (an algorithm, an optional content type, and arbitrary extension labels).
+//!
+//! Parsing does not verify signatures, certificates, or algorithm/key policy.
+//! Those checks remain the caller's responsibility. Critical headers are rejected
+//! because this subset does not implement their processing. Decoding bounds input
+//! bytes, individual strings, and nesting, not total decoded heap usage.
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt, io::Cursor};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, MapAccess, Visitor},
+    de::{self, MapAccess, SeqAccess, Visitor},
 };
 use serde_bytes::{ByteBuf, Bytes};
 
-use crate::{Result, Value, tags::Tagged};
+use crate::{Decoder, Result, Value, tags::Tagged};
 
 /// CBOR tag for a `COSE_Sign1` structure (RFC 9052 §4.2).
 const COSE_SIGN1_TAG: u64 = 18;
@@ -35,8 +40,15 @@ const LABEL_ALG: i64 = 1;
 /// IANA COSE Header Parameters registry label for `content type`.
 const LABEL_CONTENT_TYPE: i64 = 3;
 
+fn reject_pending_tags<E: de::Error>() -> std::result::Result<(), E> {
+    if !crate::tags::take_all_tags().is_empty() {
+        return Err(E::custom("unexpected tag on COSE structural field"));
+    }
+    Ok(())
+}
+
 /// A COSE header map label: either a registered integer or a private-use text label.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Label {
     Int(i64),
     Text(String),
@@ -67,6 +79,34 @@ pub struct Header {
 }
 
 impl Header {
+    fn labels(&self) -> BTreeSet<Label> {
+        let mut labels: BTreeSet<_> = self.rest.iter().map(|(label, _)| label.clone()).collect();
+        if self.alg.is_some() {
+            labels.insert(Label::Int(LABEL_ALG));
+        }
+        if self.content_type.is_some() {
+            labels.insert(Label::Int(LABEL_CONTENT_TYPE));
+        }
+        labels
+    }
+
+    fn validate(&self) -> Result<()> {
+        if matches!(self.content_type, Some(ContentType::Assigned(value)) if !(0..=65535).contains(&value))
+        {
+            return Err(crate::Error::Syntax("invalid COSE content format".into()));
+        }
+        let mut labels = BTreeSet::new();
+        for (label, _) in &self.rest {
+            if matches!(label, Label::Int(LABEL_ALG | LABEL_CONTENT_TYPE)) || !labels.insert(label)
+            {
+                return Err(crate::Error::Syntax(
+                    "duplicate or reserved COSE header label".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn field_count(&self) -> usize {
         self.alg.is_some() as usize + self.content_type.is_some() as usize + self.rest.len()
     }
@@ -76,6 +116,7 @@ impl Serialize for Header {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
+        self.validate().map_err(serde::ser::Error::custom)?;
         let mut map = serializer.serialize_map(Some(self.field_count()))?;
         if let Some(alg) = self.alg {
             map.serialize_entry(&LABEL_ALG, &alg)?;
@@ -111,8 +152,22 @@ impl<'de> Deserialize<'de> for Header {
                 self,
                 mut map: A,
             ) -> std::result::Result<Header, A::Error> {
+                reject_pending_tags()?;
                 let mut header = Header::default();
+                let mut labels = BTreeSet::new();
                 while let Some((key, value)) = map.next_entry::<Value, Value>()? {
+                    let label = match &key {
+                        Value::Integer(value) => Label::Int(*value),
+                        Value::Text(value) => Label::Text(value.clone()),
+                        _ => {
+                            return Err(de::Error::custom(
+                                "COSE header label must be an integer or text string",
+                            ));
+                        }
+                    };
+                    if !labels.insert(label) {
+                        return Err(de::Error::custom("duplicate COSE header label"));
+                    }
                     match key {
                         Value::Integer(i) if i == LABEL_ALG => {
                             header.alg = Some(value.as_i64().ok_or_else(|| {
@@ -139,11 +194,12 @@ impl<'de> Deserialize<'de> for Header {
                         }
                     }
                 }
+                header.validate().map_err(de::Error::custom)?;
                 Ok(header)
             }
         }
 
-        deserializer.deserialize_map(HeaderVisitor)
+        deserializer.deserialize_any(HeaderVisitor)
     }
 }
 
@@ -196,9 +252,10 @@ impl HeaderBuilder {
 /// is parsed from the wire, so re-verifying a signature - including one
 /// produced by a different COSE implementation - always recomputes the
 /// `Sig_structure` from the bytes that were actually signed. When building a
-/// fresh signature, `original_data` is `None`: the header is encoded once and
-/// that encoding is reused for both the stored bstr and the `Sig_structure`,
-/// which is only safe because nothing re-derives it a second time.
+/// fresh signature, `original_data` is `None`: the same ordered header encoding
+/// is used for both the stored bstr and the `Sig_structure`. Do not change the
+/// header between constructing signing inputs and storing the signature.
+/// Encoding rejects changes to decoded fields that disagree with original bytes.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProtectedHeader {
     pub header: Header,
@@ -216,8 +273,18 @@ impl ProtectedHeader {
     /// The bytes this protected header is (or would be) encoded as: the raw
     /// bytes it was parsed from, if any, otherwise a fresh encoding of `header`.
     fn encoded_bytes(&self) -> Result<Vec<u8>> {
+        self.header.validate()?;
         match &self.original_data {
-            Some(bytes) => Ok(bytes.clone()),
+            Some(bytes) => {
+                let decoded = decode_protected(bytes)?;
+                if crate::to_vec(&decoded)? != crate::to_vec(&self.header)? {
+                    return Err(crate::Error::Syntax(
+                        "COSE protected header differs from original bytes".into(),
+                    ));
+                }
+                Ok(bytes.clone())
+            }
+            None if self.header.field_count() == 0 => Ok(Vec::new()),
             None => crate::to_vec(&self.header),
         }
     }
@@ -234,9 +301,148 @@ pub struct CoseSign1 {
 
 type CoseSign1Wire = (ByteBuf, Header, Option<ByteBuf>, ByteBuf);
 
+#[derive(Serialize)]
+#[serde(transparent)]
+struct StrictBytes(ByteBuf);
+
+impl<'de> Deserialize<'de> for StrictBytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl Visitor<'_> for BytesVisitor {
+            type Value = StrictBytes;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a COSE byte string")
+            }
+
+            fn visit_byte_buf<E: de::Error>(
+                self,
+                bytes: Vec<u8>,
+            ) -> std::result::Result<Self::Value, E> {
+                reject_pending_tags()?;
+                Ok(StrictBytes(ByteBuf::from(bytes)))
+            }
+        }
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+}
+
+struct StrictPayload(Option<Vec<u8>>);
+
+impl<'de> Deserialize<'de> for StrictPayload {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct PayloadVisitor;
+        impl Visitor<'_> for PayloadVisitor {
+            type Value = StrictPayload;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a COSE payload byte string or null")
+            }
+
+            fn visit_byte_buf<E: de::Error>(
+                self,
+                bytes: Vec<u8>,
+            ) -> std::result::Result<Self::Value, E> {
+                reject_pending_tags()?;
+                Ok(StrictPayload(Some(bytes)))
+            }
+
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                reject_pending_tags()?;
+                Ok(StrictPayload(None))
+            }
+        }
+        deserializer.deserialize_any(PayloadVisitor)
+    }
+}
+
+struct StrictSign1Wire(StrictBytes, Header, StrictPayload, StrictBytes);
+
+impl<'de> Deserialize<'de> for StrictSign1Wire {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct WireVisitor;
+        impl<'de> Visitor<'de> for WireVisitor {
+            type Value = StrictSign1Wire;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a four-element COSE_Sign1 array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                reject_pending_tags()?;
+                let protected = sequence
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let unprotected = sequence
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let payload = sequence
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let signature = sequence
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+                if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::invalid_length(5, &self));
+                }
+                Ok(StrictSign1Wire(protected, unprotected, payload, signature))
+            }
+        }
+        deserializer.deserialize_tuple(4, WireVisitor)
+    }
+}
+
+fn decode_protected(bytes: &[u8]) -> Result<Header> {
+    if bytes.is_empty() {
+        return Ok(Header::default());
+    }
+    let mut cursor = Cursor::new(bytes);
+    let header = Decoder::new(&mut cursor)
+        .with_max_allocation(crate::DEFAULT_MAX_ALLOCATION)
+        .decode()?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(crate::Error::Syntax(
+            "trailing data in COSE protected header".into(),
+        ));
+    }
+    Ok(header)
+}
+
 impl CoseSign1 {
+    fn validate(&self) -> Result<()> {
+        self.protected.header.validate()?;
+        self.unprotected.validate()?;
+        if !self
+            .protected
+            .header
+            .labels()
+            .is_disjoint(&self.unprotected.labels())
+        {
+            return Err(crate::Error::Syntax(
+                "COSE header label appears in both buckets".into(),
+            ));
+        }
+        if self
+            .protected
+            .header
+            .rest
+            .iter()
+            .chain(&self.unprotected.rest)
+            .any(|(label, _)| *label == Label::Int(2))
+        {
+            return Err(crate::Error::Syntax(
+                "critical COSE headers are not supported by this C2PA subset".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Encode as a CBOR-tagged (tag 18) `COSE_Sign1` structure.
     pub fn to_tagged_vec(&self) -> Result<Vec<u8>> {
+        self.validate()?;
         let protected_bytes = self.protected.encoded_bytes()?;
         let wire: CoseSign1Wire = (
             ByteBuf::from(protected_bytes),
@@ -249,36 +455,73 @@ impl CoseSign1 {
 
     /// Decode a CBOR-tagged (tag 18) `COSE_Sign1` structure.
     pub fn from_tagged_slice(bytes: &[u8]) -> Result<Self> {
-        let tagged = Tagged::<CoseSign1Wire>::from_tagged_slice(bytes)?;
-        if tagged.tag != Some(COSE_SIGN1_TAG) {
+        Self::from_tagged_slice_with_limit(bytes, crate::DEFAULT_MAX_ALLOCATION)
+    }
+
+    /// Decode with a maximum input length and per-string allocation limit.
+    /// This is not a total decoded-memory budget; nesting uses the default limit.
+    pub fn from_tagged_slice_with_limit(bytes: &[u8], max_size: usize) -> Result<Self> {
+        if bytes.len() > max_size {
+            return Err(crate::Error::Syntax(
+                "COSE input exceeds maximum size".into(),
+            ));
+        }
+        let mut cursor = Cursor::new(bytes);
+        let mut decoder = Decoder::new(&mut cursor).with_max_allocation(max_size);
+        let tag = decoder.read_tag()?;
+        if tag != COSE_SIGN1_TAG {
             return Err(crate::Error::Syntax(format!(
-                "expected COSE_Sign1 tag {COSE_SIGN1_TAG}, found {:?}",
-                tagged.tag
+                "expected COSE_Sign1 tag {COSE_SIGN1_TAG}, found {tag}"
             )));
         }
-        let (protected_bytes, unprotected, payload, signature) = tagged.value;
-        let protected_bytes = protected_bytes.into_vec();
-        let header: Header = crate::from_slice(&protected_bytes)?;
+        let StrictSign1Wire(protected_bytes, unprotected, payload, signature) = decoder.decode()?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(crate::Error::Syntax(
+                "trailing data after COSE_Sign1".into(),
+            ));
+        }
+        let protected_bytes = protected_bytes.0.into_vec();
+        let header = decode_protected(&protected_bytes)?;
 
-        Ok(CoseSign1 {
+        let sign1 = CoseSign1 {
             protected: ProtectedHeader {
                 header,
                 original_data: Some(protected_bytes),
             },
             unprotected,
-            payload: payload.map(ByteBuf::into_vec),
-            signature: signature.into_vec(),
-        })
+            payload: payload.0,
+            signature: signature.0.into_vec(),
+        };
+        sign1.validate()?;
+        Ok(sign1)
     }
 
     /// The "to be signed" bytes for this structure: the RFC 8152 §4.4
     /// `Sig_structure`, computed over this structure's own protected header,
     /// `external_aad`, and (if present) its own payload.
     pub fn tbs_data(&self, external_aad: &[u8]) -> Result<Vec<u8>> {
+        self.validate()?;
         sig_structure_data(
+            SignatureContext::CoseSign1,
             &self.protected,
             external_aad,
-            self.payload.as_deref().unwrap_or(&[]),
+            self.payload.as_deref().ok_or_else(|| {
+                crate::Error::Syntax("detached COSE payload requires detached_tbs_data".into())
+            })?,
+        )
+    }
+
+    /// Signing inputs for an explicitly supplied detached payload.
+    pub fn detached_tbs_data(&self, external_aad: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+        self.validate()?;
+        if self.payload.is_some() {
+            return Err(crate::Error::Syntax("COSE payload is not detached".into()));
+        }
+        sig_structure_data(
+            SignatureContext::CoseSign1,
+            &self.protected,
+            external_aad,
+            payload,
         )
     }
 }
@@ -313,21 +556,35 @@ impl CoseSign1Builder {
     }
 }
 
-/// Build the RFC 8152 §4.4 `Sig_structure` bytes for a `COSE_Sign1`:
-/// `["Signature1", protected_bstr, external_aad, payload]`, a definite-length
-/// 4-element CBOR array.
-///
-/// Unlike `coset::sig_structure_data`, this only ever builds the `COSE_Sign1`
-/// context (c2pa-rs never signs multi-signer `COSE_Sign` structures), so
-/// there's no `SignatureContext` or "sign protected" parameter to pass.
+/// The four-element signing contexts used by C2PA (RFC 8152 section 4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureContext {
+    CoseSign1,
+    CounterSignature,
+}
+
+impl SignatureContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            SignatureContext::CoseSign1 => "Signature1",
+            SignatureContext::CounterSignature => "CounterSignature",
+        }
+    }
+}
+
+/// Build the RFC 8152 §4.4 `Sig_structure` bytes: `[context, protected_bstr,
+/// external_aad, payload]`, a definite-length 4-element CBOR array.
+/// `CounterSignature` supports only C2PA's form with no signer-protected header.
+/// This helper does not implement general countersignature message processing.
 pub fn sig_structure_data(
+    context: SignatureContext,
     protected: &ProtectedHeader,
     external_aad: &[u8],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     let protected_bytes = protected.encoded_bytes()?;
     let tuple = (
-        "Signature1",
+        context.as_str(),
         Bytes::new(&protected_bytes),
         Bytes::new(external_aad),
         Bytes::new(payload),
@@ -420,7 +677,8 @@ mod tests {
     #[test]
     fn tbs_data_is_four_element_array_of_signature1_context() {
         let protected = ProtectedHeader::new(sample_header());
-        let tbs = sig_structure_data(&protected, b"", b"payload").unwrap();
+        let tbs =
+            sig_structure_data(SignatureContext::CoseSign1, &protected, b"", b"payload").unwrap();
 
         // Definite-length array of 4 elements.
         assert_eq!(tbs[0], 0x84);

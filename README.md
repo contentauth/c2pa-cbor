@@ -18,14 +18,48 @@ A fast, lightweight CBOR (Concise Binary Object Representation) encoder/decoder 
 - **Always definite-length output** - indefinite-length CBOR is never produced
 - **Opt-in deterministic encoding** - RFC 8949 §4.2.1 Core Deterministic Encoding Requirements compliant (sorted map/struct keys, shortest-form floats, canonical NaN), required for C2PA manifests
 
+## C2PA COSE Support
+
+Enable `features = ["cose"]` for the C2PA-focused `cose` module. It provides
+tagged COSE_Sign1 parsing/encoding, ordered header extensions, and signing-input
+bytes compatible with `coset`. It also provides C2PA's four-element
+`CounterSignature` signing-input form with no signer-protected header; it is not
+a general-purpose COSE implementation.
+
+Decoded protected-header bytes are preserved exactly. Changing decoded fields
+without updating those bytes is rejected when encoding or constructing signing
+inputs. Duplicate labels, conflicting protected/unprotected labels, malformed
+structural fields, trailing input, and critical headers are rejected. Critical
+header processing is deliberately outside this subset.
+
+Use `tbs_data(aad)` for attached payloads and
+`detached_tbs_data(aad, payload)` for detached payloads. Parsing and constructing
+signing inputs do not verify signatures, algorithm/key policy, certificates, or
+trust. Those remain c2pa-rs responsibilities. The helper API is fallible and is
+not a source-compatible replacement for every `coset` API.
+
+`CoseSign1::from_tagged_slice_with_limit(bytes, max_size)` bounds input size and
+individual string allocations; the default is 100 MiB. Nesting is limited to
+128 levels. These are not total heap or CPU budgets. Applications should choose
+an input limit suitable for their manifest sizes.
+
+Regression tests retain `coset` as a dev-only interoperability oracle. The fuzz
+target exercises both CBOR and COSE decoding and signing-input round trips:
+`ASAN_OPTIONS=quarantine_size_mb=32 cargo +nightly fuzz run decode -- -max_total_time=60 -rss_limit_mb=512`.
+The sanitizer quarantine is bounded so retained freed allocations do not exhaust
+the fuzz process's memory ceiling during long runs.
+
 ## Security
 
 This library includes built-in protection against malicious CBOR attacks:
 
-- **Allocation limit**: Default 100MB limit prevents out-of-memory (OOM) attacks from CBOR claiming extremely large sizes
+- **Allocation limit**: Default 100MB per-value string limit rejects oversized declared lengths
 - **Recursion depth limit**: Default 128-level nesting limit prevents stack overflow from deeply nested structures
 
-These limits are sufficient for legitimate C2PA manifests while preventing denial-of-service attacks. For advanced use cases requiring custom limits, use the builder pattern:
+These limits provide defense in depth, not a total memory or execution-time
+budget: collection entries and caller-owned Serde values can consume additional
+memory. Bound untrusted input sizes as well. For custom decoder limits, use the
+builder pattern:
 
 ```rust
 use c2pa_cbor::Decoder;

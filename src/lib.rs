@@ -68,7 +68,9 @@
 //! - Small arrays (1KB): ~160ns encode, ~270ns decode
 //! - Large arrays (1MB): ~30µs encode, ~41µs decode
 //! - Performance scales linearly with data size
-//! - Zero-copy design means encoding is just a memcpy after writing the header
+//! - Encoding is zero-copy (just a memcpy after writing the header); decoding
+//!   is not yet -- it allocates an owned `String`/`Vec<u8>` per text/byte
+//!   string value, even when decoding from an in-memory `&[u8]`
 //!
 //! ## Example
 //! ```rust

@@ -15,8 +15,7 @@
 //! identical `COSE_Sign1` output to `coset` for the header shapes c2pa-rs
 //! actually uses. `coset` is a temporary, `[dev-dependencies]`-only crate here
 //! (see Cargo.toml) purely for this comparison; it's not a runtime dependency
-//! of `c2pa_cbor` and is expected to be dropped once this file has done its
-//! job.
+//! of `c2pa_cbor`. Keep these fixtures as ongoing interoperability regressions.
 #![cfg(feature = "cose")]
 
 use c2pa_cbor::cose::{
@@ -31,6 +30,191 @@ use coset::{
 const AAD: &[u8] = b"";
 const PAYLOAD: &[u8] = b"hello, c2pa";
 const SIGNATURE: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
+
+#[test]
+fn empty_headers_and_c2pa_countersignature_match_coset() {
+    assert_matches(
+        |header| header,
+        |header| header,
+        |header| header,
+        |header| header,
+    );
+    for algorithm in [None, Some(-7)] {
+        let header = c2pa_cose::Header {
+            alg: algorithm,
+            ..Default::default()
+        };
+        let protected = c2pa_cose::ProtectedHeader::new(header);
+        let mut coset_header = coset::Header::default();
+        if algorithm.is_some() {
+            coset_header = CosetHeaderBuilder::new()
+                .algorithm(iana::Algorithm::ES256)
+                .build();
+        }
+        let expected = coset::sig_structure_data(
+            coset::SignatureContext::CounterSignature,
+            coset::ProtectedHeader {
+                header: coset_header,
+                original_data: None,
+            },
+            None,
+            b"external aad",
+            PAYLOAD,
+        );
+        let actual = c2pa_cose::sig_structure_data(
+            c2pa_cose::SignatureContext::CounterSignature,
+            &protected,
+            b"external aad",
+            PAYLOAD,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn malformed_wire_types_and_lengths_are_rejected() {
+    let cases: &[&[u8]] = &[
+        &[0xd2, 0x84, 0x81, 0x00, 0xa0, 0xf6, 0x40],
+        &[0xd2, 0x84, 0x40, 0xa0, 0x60, 0x40],
+        &[0xd2, 0x84, 0x40, 0xa0, 0xf6, 0x60],
+        &[0xd2, 0x84, 0x40, 0xa0, 0xf6, 0x80],
+        &[0xd2, 0x84, 0x40, 0xa0, 0xc0, 0x40, 0x40],
+        &[0xd2, 0xc0, 0x84, 0x40, 0xa0, 0xf6, 0x40],
+        &[0xd2, 0x84, 0x42, 0xc0, 0xa0, 0xa0, 0xf6, 0x40],
+        &[0xd2, 0x84, 0x40, 0xa0, 0xf6, 0x40, 0x00],
+        &[0xd2, 0x85, 0x40, 0xa0, 0xf6, 0x40, 0x00],
+        &[0xd2, 0x83, 0x40, 0xa0, 0xf6],
+        &[0xd2, 0x84, 0x40, 0xc0, 0xa0, 0xf6, 0x40],
+        &[0xd2, 0x84, 0x40, 0xa1, 0xc0, 0x01, 0x26, 0xf6, 0x40],
+    ];
+    for bytes in cases {
+        assert!(
+            c2pa_cose::CoseSign1::from_tagged_slice(bytes).is_err(),
+            "{bytes:02x?}"
+        );
+        assert!(
+            coset::CoseSign1::from_tagged_slice(bytes).is_err(),
+            "{bytes:02x?}"
+        );
+    }
+}
+
+#[test]
+fn nonpreferred_protected_bytes_are_preserved_and_mutation_is_rejected() {
+    let bytes = [
+        0xd2, 0x84, 0x45, 0xa1, 0x18, 0x01, 0x38, 0x06, 0xa0, 0x41, 0x61, 0x40,
+    ];
+    let mut actual = c2pa_cose::CoseSign1::from_tagged_slice(&bytes).unwrap();
+    let expected = coset::CoseSign1::from_tagged_slice(&bytes).unwrap();
+    assert_eq!(actual.to_tagged_vec().unwrap(), bytes);
+    assert_eq!(actual.tbs_data(b"aad").unwrap(), expected.tbs_data(b"aad"));
+    actual.protected.header.alg = Some(-35);
+    assert!(actual.to_tagged_vec().is_err());
+    assert!(actual.tbs_data(b"aad").is_err());
+}
+
+#[test]
+fn detached_payload_is_explicit_and_matches_coset() {
+    let actual = c2pa_cose::CoseSign1::default();
+    let expected = coset::CoseSign1::default();
+    assert!(actual.tbs_data(b"aad").is_err());
+    assert_eq!(
+        actual.detached_tbs_data(b"aad", PAYLOAD).unwrap(),
+        expected.tbs_detached_data(PAYLOAD, b"aad")
+    );
+    let attached = c2pa_cose::CoseSign1Builder::new()
+        .payload(Vec::new())
+        .build();
+    assert!(attached.detached_tbs_data(b"aad", PAYLOAD).is_err());
+    assert!(attached.tbs_data(b"aad").is_ok());
+}
+
+#[test]
+fn duplicate_headers_and_unsupported_critical_headers_are_rejected() {
+    for bytes in [
+        vec![0xa2, 0x01, 0x26, 0x01, 0x38, 0x22],
+        vec![0xa2, 0x03, 0x00, 0x03, 0x01],
+        vec![0xa2, 0x61, b'x', 0x00, 0x61, b'x', 0x01],
+        vec![0xa1, 0x03, 0x20],
+        vec![0xa1, 0x03, 0x1a, 0x00, 0x01, 0x00, 0x00],
+    ] {
+        assert!(c2pa_cbor::from_slice::<c2pa_cose::Header>(&bytes).is_err());
+    }
+    for label in [1, 3, 33] {
+        let header = C2paHeaderBuilder::new()
+            .value(label, c2pa_cbor::Value::Integer(0))
+            .value(label, c2pa_cbor::Value::Integer(1))
+            .build();
+        assert!(c2pa_cbor::to_vec(&header).is_err());
+    }
+    let header = C2paHeaderBuilder::new().algorithm(-7).build();
+    let actual = c2pa_cose::CoseSign1Builder::new()
+        .protected(header.clone())
+        .unprotected(header)
+        .payload(Vec::new())
+        .build();
+    assert!(actual.to_tagged_vec().is_err());
+    assert!(actual.tbs_data(b"").is_err());
+    let conflicting = [
+        0xd2, 0x84, 0x43, 0xa1, 0x01, 0x26, 0xa1, 0x01, 0x26, 0xf6, 0x40,
+    ];
+    assert!(c2pa_cose::CoseSign1::from_tagged_slice(&conflicting).is_err());
+    let critical = [0xd2, 0x84, 0x44, 0xa1, 0x02, 0x81, 0x01, 0xa0, 0xf6, 0x40];
+    assert!(c2pa_cose::CoseSign1::from_tagged_slice(&critical).is_err());
+}
+
+#[test]
+fn cose_limits_truncation_and_tagged_extensions() {
+    assert!(
+        c2pa_cose::CoseSign1::from_tagged_slice(&[0xd2, 0x84, 0x40, 0xa0, 0xf7, 0x40]).is_err()
+    );
+    let valid = [0xd2, 0x84, 0x40, 0xa0, 0xf6, 0x40];
+    for end in 0..valid.len() {
+        assert!(c2pa_cose::CoseSign1::from_tagged_slice(&valid[..end]).is_err());
+    }
+    assert!(c2pa_cose::CoseSign1::from_tagged_slice_with_limit(&valid, valid.len()).is_ok());
+    assert!(c2pa_cose::CoseSign1::from_tagged_slice_with_limit(&valid, valid.len() - 1).is_err());
+    let huge = [0xd2, 0x84, 0x5a, 0xff, 0xff, 0xff, 0xff];
+    assert!(
+        c2pa_cose::CoseSign1::from_tagged_slice_with_limit(&huge, 1024)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum")
+    );
+    let header = C2paHeaderBuilder::new()
+        .text_value(
+            "extension".into(),
+            c2pa_cbor::Value::Tag(100, Box::new(c2pa_cbor::Value::Integer(1))),
+        )
+        .build();
+    let actual = c2pa_cose::CoseSign1Builder::new()
+        .unprotected(header.clone())
+        .build();
+    assert_eq!(
+        c2pa_cose::CoseSign1::from_tagged_slice(&actual.to_tagged_vec().unwrap())
+            .unwrap()
+            .unprotected,
+        header
+    );
+    let mut nested = vec![0x81; 150];
+    nested.push(0x00);
+    let mut protected = vec![0xa1, 0x61, b'x'];
+    protected.extend_from_slice(&nested);
+    let wire = (
+        serde_bytes::ByteBuf::from(protected),
+        c2pa_cose::Header::default(),
+        Option::<serde_bytes::ByteBuf>::None,
+        serde_bytes::ByteBuf::new(),
+    );
+    let bytes = c2pa_cbor::to_vec(&c2pa_cbor::Tagged::new(Some(18), wire)).unwrap();
+    assert!(
+        c2pa_cose::CoseSign1::from_tagged_slice(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("nesting depth")
+    );
+}
 
 /// Build a `coset::CoseSign1` and the equivalent `c2pa_cbor::cose::CoseSign1`
 /// from the same protected/unprotected header-builder closures, and assert
