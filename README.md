@@ -38,6 +38,71 @@ signing inputs do not verify signatures, algorithm/key policy, certificates, or
 trust. Those remain c2pa-rs responsibilities. The helper API is fallible and is
 not a source-compatible replacement for every `coset` API.
 
+### C2PA 2.4 COSE Rules
+
+The generic COSE API remains policy-neutral. Use the opt-in C2PA helpers to
+check the profile; successful COSE parsing alone does not establish C2PA validity.
+
+| Specification | Library support |
+| --- | --- |
+| 10.3.2.4, 13.2.2-13.2.3 | Tag 18 is required by tagged parsing/encoding. `None` encodes detached content as CBOR null; `Some(vec![])` is an embedded empty byte string. `validate_c2pa_claim()` requires detached content and a credential. |
+| 13.2.3, 13.2.6 | `c2pa_tbs_data()` and `c2pa_detached_tbs_data(payload)` use `Signature1`, empty external AAD, and a byte-string payload. They require integer `alg` label 1 in the protected header. `ProtectedHeader::encoded_bytes()` exposes the exact protected bytes. |
+| 10.3.2.5.2-10.3.2.5.3 | `signature_bstr()` encodes a newly generated signature including its CBOR byte-string header. For received signatures, `CoseSign1::signature_bstr_from_tagged_slice(wire)` borrows the exact field, including nonpreferred encodings. Pass these bytes to `c2pa_timestamp_tbs_data(payload)` for v2; pass claim bytes for legacy v1. This produces the four-element `CounterSignature` input with empty external AAD. |
+| 10.3.2.5.4, 15.8.1 | `timestamp_token(TimestampVersion::V1/V2)` reads an opaque response/token from the unprotected `sigTst`/`sigTst2` container and requires exactly one `tstTokens` entry with a byte-string `val`. A malformed container returns an accessor error without rejecting COSE parsing. |
+| 13.2.4, 15.8.3 | `Header::get(&Label::Text("iat".into()))` exposes claimed signing time. C2PA profile checks require an untagged, finite numeric value in the protected bucket when present. |
+| 14.2, 14.5 | `x5chain()` exposes ordered DER certificate bytes, accepting integer 33 or legacy text labels in either bucket. Integer 33 wins across buckets; duplicate identical labels are rejected. Missing or malformed chains are errors. `validate_c2pa_claim_for_signing()` additionally requires the selected credential in the protected bucket. |
+| 14.5.2, 15.9 | `ocsp_responses()` reads the nonempty `rVals.ocspVals` array of opaque byte strings from the unprotected bucket. |
+| 9.4.2 | Embedded segment-info CBOR is available through `payload`; session `kid` is available through `unprotected.get(&Label::Int(4))`. Use `c2pa_tbs_data()` for signing/verification inputs. No X.509 credential is required by this helper. |
+
+For claim generation, prefer integer label 33 and call
+`validate_c2pa_claim_for_signing()`. This check also rejects deprecated v1
+timestamps, protected timestamp/revocation headers, and malformed v2/OCSP
+containers. Optional headers should be omitted when no content is available.
+Headers can be constructed using `HeaderBuilder::value` / `text_value` with
+`Value::Bytes`, `Value::Array`, and `Value::Map`; extension values remain fully
+accessible through `Header::rest` and `Header::get`.
+
+Retain the original wire bytes when verifying a received v2 timestamp.
+`to_tagged_vec()` preserves protected-header bytes but re-encodes the signature
+byte string using the preferred encoding. Rewriting a nonpreferred signature
+field can therefore invalidate its existing timestamp imprint; the borrowed
+raw-field accessor is intended for verification without that normalization.
+
+```rust
+# #[cfg(feature = "cose")]
+# fn example() -> c2pa_cbor::Result<()> {
+use c2pa_cbor::{Value, cose::{CoseSign1Builder, HeaderBuilder}};
+
+let claim_cbor = vec![0xa0];
+let certificate_der = vec![0x30]; // Replace with the signer certificate DER.
+let mut cose = CoseSign1Builder::new()
+    .protected(HeaderBuilder::new()
+        .algorithm(-7)
+        .value(33, Value::Bytes(certificate_der))
+        .build())
+    .build();
+cose.validate_c2pa_claim_for_signing()?;
+let signing_input = cose.c2pa_detached_tbs_data(&claim_cbor)?;
+// Sign signing_input externally and store the resulting signature bytes.
+cose.signature = vec![0; 64];
+let timestamp_payload = cose.signature_bstr()?;
+let timestamp_input = cose.c2pa_timestamp_tbs_data(&timestamp_payload)?;
+// Hash timestamp_input externally, request a TSA token, and add sigTst2.
+let wire = cose.to_tagged_vec()?;
+# let _ = (signing_input, timestamp_input, wire);
+# Ok(())
+# }
+```
+
+The caller must validate algorithm/hash policy, cryptographic signatures, DER
+content, certificate profiles and chain completeness/order, EKUs, trust anchors,
+validity periods, revocation, RFC 3161 responses/message imprints, and the total
+number of timestamps across sources. Informational/failure status codes and
+fallback behavior are also caller-owned. JUMBF references, timestamp assertions,
+and BMFF `emsg` fields are outside this CBOR/COSE library. Certificate bytes are
+untrusted input, not trust anchors. These APIs enable the supplied workflows;
+they do not constitute a complete C2PA validator.
+
 `CoseSign1::from_tagged_slice_with_limit(bytes, max_size)` bounds input size and
 individual string allocations; the default is 100 MiB. Nesting is limited to
 128 levels. These are not total heap or CPU budgets. Applications should choose

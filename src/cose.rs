@@ -22,7 +22,12 @@
 //! because this subset does not implement their processing. Decoding bounds input
 //! bytes, individual strings, and nesting, not total decoded heap usage.
 
-use std::{collections::BTreeSet, fmt, io::Cursor};
+use std::{
+    cell::Cell,
+    collections::BTreeSet,
+    fmt,
+    io::{Cursor, Read},
+};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -79,6 +84,15 @@ pub struct Header {
 }
 
 impl Header {
+    /// Look up an extension header by its exact integer or text label.
+    /// Algorithm and content type remain available through their typed fields.
+    pub fn get(&self, label: &Label) -> Option<&Value> {
+        self.rest
+            .iter()
+            .find(|(key, _)| key == label)
+            .map(|(_, value)| value)
+    }
+
     fn labels(&self) -> BTreeSet<Label> {
         let mut labels: BTreeSet<_> = self.rest.iter().map(|(label, _)| label.clone()).collect();
         if self.alg.is_some() {
@@ -272,7 +286,7 @@ impl ProtectedHeader {
 
     /// The bytes this protected header is (or would be) encoded as: the raw
     /// bytes it was parsed from, if any, otherwise a fresh encoding of `header`.
-    fn encoded_bytes(&self) -> Result<Vec<u8>> {
+    pub fn encoded_bytes(&self) -> Result<Vec<u8>> {
         self.header.validate()?;
         match &self.original_data {
             Some(bytes) => {
@@ -412,6 +426,202 @@ fn decode_protected(bytes: &[u8]) -> Result<Header> {
 }
 
 impl CoseSign1 {
+    /// Check the common C2PA signing requirements, without cryptographic policy checks.
+    pub fn validate_c2pa(&self) -> Result<()> {
+        self.validate()?;
+        self.protected.encoded_bytes()?;
+        if self.protected.header.alg.is_none() {
+            return Err(crate::Error::Syntax(
+                "C2PA requires a protected alg header".into(),
+            ));
+        }
+        if self
+            .protected
+            .header
+            .rest
+            .iter()
+            .chain(&self.unprotected.rest)
+            .any(|(label, _)| *label == Label::Text("alg".into()))
+        {
+            return Err(crate::Error::Syntax(
+                "C2PA alg must use integer label 1".into(),
+            ));
+        }
+        let iat = Label::Text("iat".into());
+        if self.unprotected.get(&iat).is_some()
+            || self.protected.header.get(&iat).is_some_and(|value| {
+                !matches!(value, Value::Integer(_) | Value::Float(_))
+                    || matches!(value, Value::Float(number) if !number.is_finite())
+            })
+        {
+            return Err(crate::Error::Syntax(
+                "C2PA iat must be an untagged protected NumericDate".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check a claim signature's COSE profile, accepting legacy credential placement.
+    /// Does not validate certificates, algorithm policy, or the signature itself.
+    pub fn validate_c2pa_claim(&self) -> Result<()> {
+        self.validate_c2pa()?;
+        if self.payload.is_some() {
+            return Err(crate::Error::Syntax(
+                "C2PA claims require detached content".into(),
+            ));
+        }
+        self.x5chain()?;
+        Ok(())
+    }
+
+    /// Check claim generation requirements, including a protected credential.
+    /// Prefer integer label 33 when constructing the header.
+    pub fn validate_c2pa_claim_for_signing(&self) -> Result<()> {
+        self.validate_c2pa_claim()?;
+        let label = if self.protected.header.get(&Label::Int(33)).is_some()
+            || self.unprotected.get(&Label::Int(33)).is_some()
+        {
+            Label::Int(33)
+        } else {
+            Label::Text("x5chain".into())
+        };
+        if self.protected.header.get(&label).is_none() {
+            return Err(crate::Error::Syntax(
+                "C2PA claim generators require protected x5chain".into(),
+            ));
+        }
+        if self
+            .protected
+            .header
+            .get(&Label::Text("sigTst".into()))
+            .is_some()
+            || self
+                .unprotected
+                .get(&Label::Text("sigTst".into()))
+                .is_some()
+        {
+            return Err(crate::Error::Syntax(
+                "C2PA generators must not create v1 timestamps".into(),
+            ));
+        }
+        for name in ["sigTst2", "rVals"] {
+            if self
+                .protected
+                .header
+                .get(&Label::Text(name.into()))
+                .is_some()
+            {
+                return Err(crate::Error::Syntax(format!(
+                    "C2PA {name} must be unprotected"
+                )));
+            }
+        }
+        self.timestamp_token(TimestampVersion::V2)?;
+        self.ocsp_responses()?;
+        Ok(())
+    }
+
+    /// Return the ordered, opaque DER certificates. Integer label 33 takes
+    /// precedence over the legacy text label, across both header buckets.
+    /// Duplicate labels are rejected even when their values are identical.
+    pub fn x5chain(&self) -> Result<Vec<&[u8]>> {
+        self.validate()?;
+        let find = |label: &Label| {
+            self.protected
+                .header
+                .get(label)
+                .or_else(|| self.unprotected.get(label))
+        };
+        let value = find(&Label::Int(33))
+            .or_else(|| find(&Label::Text("x5chain".into())))
+            .ok_or_else(|| crate::Error::Syntax("missing C2PA x5chain credential".into()))?;
+        byte_strings(value, true)
+    }
+
+    /// Retrieve one opaque RFC 3161 response (`sigTst`) or token (`sigTst2`).
+    /// A malformed container is an accessor error, not a COSE parsing failure;
+    /// callers can ignore it and report the appropriate informational status.
+    pub fn timestamp_token(&self, version: TimestampVersion) -> Result<Option<&[u8]>> {
+        let label = Label::Text(version.label().into());
+        let Some(container) = self.unprotected.get(&label) else {
+            return Ok(None);
+        };
+        let tokens = map_field(container, "tstTokens")?;
+        let Value::Array(tokens) = tokens else {
+            return Err(crate::Error::Syntax("tstTokens must be an array".into()));
+        };
+        if tokens.len() != 1 {
+            return Err(crate::Error::Syntax(
+                "C2PA requires one timestamp token".into(),
+            ));
+        }
+        match map_field(&tokens[0], "val")? {
+            Value::Bytes(bytes) => Ok(Some(bytes)),
+            _ => Err(crate::Error::Syntax(
+                "timestamp val must be a byte string".into(),
+            )),
+        }
+    }
+
+    /// Retrieve opaque stapled OCSP responses without interpreting their DER.
+    pub fn ocsp_responses(&self) -> Result<Option<Vec<&[u8]>>> {
+        self.unprotected
+            .get(&Label::Text("rVals".into()))
+            .map(|container| byte_strings(map_field(container, "ocspVals")?, false))
+            .transpose()
+    }
+
+    /// Encode this signature as a complete CBOR byte string for a newly
+    /// generated v2 timestamp. For received messages use
+    /// [`Self::signature_bstr_from_tagged_slice`] to preserve wire encoding.
+    pub fn signature_bstr(&self) -> Result<Vec<u8>> {
+        crate::to_vec(&Bytes::new(&self.signature))
+    }
+
+    /// Borrow the exact encoded signature field, including its byte-string
+    /// header (and any indefinite-length chunks), from a received message.
+    pub fn signature_bstr_from_tagged_slice(bytes: &[u8]) -> Result<&[u8]> {
+        Self::from_tagged_slice(bytes)?;
+        let position = Cell::new(0);
+        let reader = PositionReader {
+            bytes,
+            position: &position,
+        };
+        let mut decoder = Decoder::new(reader);
+        decoder.read_tag()?;
+        let (start, end) = serde::Deserializer::deserialize_tuple(
+            &mut decoder,
+            4,
+            SignatureRangeVisitor(&position),
+        )?;
+        Ok(&bytes[start..end])
+    }
+
+    /// C2PA timestamp inputs, with `CounterSignature` and empty external AAD.
+    /// Supply claim bytes for v1, or the complete encoded signature byte string
+    /// for v2. This does not hash the result or interpret RFC 3161 content.
+    pub fn c2pa_timestamp_tbs_data(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.validate_c2pa()?;
+        sig_structure_data(
+            SignatureContext::CounterSignature,
+            &self.protected,
+            &[],
+            payload,
+        )
+    }
+
+    /// C2PA signing inputs for an embedded payload, with empty external AAD.
+    pub fn c2pa_tbs_data(&self) -> Result<Vec<u8>> {
+        self.validate_c2pa()?;
+        self.tbs_data(&[])
+    }
+
+    /// C2PA signing inputs for detached content, with empty external AAD.
+    pub fn c2pa_detached_tbs_data(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.validate_c2pa()?;
+        self.detached_tbs_data(&[], payload)
+    }
+
     fn validate(&self) -> Result<()> {
         self.protected.header.validate()?;
         self.unprotected.validate()?;
@@ -526,6 +736,91 @@ impl CoseSign1 {
     }
 }
 
+/// The two timestamp header formats supported by C2PA 2.4 validators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampVersion {
+    /// Deprecated RFC 3161 TimeStampResp, with the claim as timestamp payload.
+    V1,
+    /// RFC 3161 TimeStampToken, with the encoded signature as timestamp payload.
+    V2,
+}
+
+impl TimestampVersion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "sigTst",
+            Self::V2 => "sigTst2",
+        }
+    }
+}
+
+fn map_field<'a>(value: &'a Value, name: &str) -> Result<&'a Value> {
+    let Value::Map(entries) = value else {
+        return Err(crate::Error::Syntax(
+            "C2PA header container must be a map".into(),
+        ));
+    };
+    entries
+        .get(&Value::Text(name.into()))
+        .ok_or_else(|| crate::Error::Syntax(format!("missing {name}")))
+}
+
+fn byte_strings(value: &Value, allow_single: bool) -> Result<Vec<&[u8]>> {
+    match value {
+        Value::Bytes(bytes) if allow_single => Ok(vec![bytes]),
+        Value::Array(values) if !values.is_empty() => values
+            .iter()
+            .map(|value| match value {
+                Value::Bytes(bytes) => Ok(bytes.as_slice()),
+                _ => Err(crate::Error::Syntax("expected a byte string".into())),
+            })
+            .collect(),
+        _ => Err(crate::Error::Syntax(
+            "expected a nonempty byte-string array".into(),
+        )),
+    }
+}
+
+struct PositionReader<'a> {
+    bytes: &'a [u8],
+    position: &'a Cell<usize>,
+}
+
+impl Read for PositionReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.bytes.read(buffer)?;
+        self.position.set(self.position.get() + count);
+        Ok(count)
+    }
+}
+
+struct SignatureRangeVisitor<'a>(&'a Cell<usize>);
+
+impl<'de> Visitor<'de> for SignatureRangeVisitor<'_> {
+    type Value = (usize, usize);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a four-element COSE_Sign1 array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut sequence: A,
+    ) -> std::result::Result<Self::Value, A::Error> {
+        for index in 0..3 {
+            sequence
+                .next_element::<de::IgnoredAny>()?
+                .ok_or_else(|| de::Error::invalid_length(index, &self))?;
+        }
+        let start = self.0.get();
+        sequence
+            .next_element::<de::IgnoredAny>()?
+            .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+        let end = self.0.get();
+        Ok((start, end))
+    }
+}
+
 /// Builder for [`CoseSign1`], mirroring the small subset of
 /// `coset::CoseSign1Builder` that c2pa-rs uses.
 #[derive(Default)]
@@ -595,6 +890,227 @@ pub fn sig_structure_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn container(name: &str, value: Value) -> Value {
+        Value::Map([(Value::Text(name.into()), value)].into_iter().collect())
+    }
+
+    fn claim_signature() -> CoseSign1 {
+        CoseSign1Builder::new().protected(sample_header()).build()
+    }
+
+    #[test]
+    fn c2pa_x5chain_label_precedence_and_legacy_placement() {
+        let mut sign1 = claim_signature();
+        assert_eq!(sign1.x5chain().unwrap(), vec![&[1, 2, 3][..]]);
+        assert!(sign1.validate_c2pa_claim_for_signing().is_ok());
+        sign1
+            .unprotected
+            .rest
+            .push((Label::Text("x5chain".into()), Value::Bool(false)));
+        assert_eq!(sign1.x5chain().unwrap(), vec![&[1, 2, 3][..]]);
+        sign1
+            .unprotected
+            .rest
+            .push((Label::Int(33), Value::Bytes(vec![1, 2, 3])));
+        assert!(sign1.x5chain().is_err());
+        sign1.unprotected.rest.clear();
+        sign1.protected.header.rest.clear();
+        assert!(sign1.validate_c2pa_claim().is_err());
+        sign1.unprotected.rest.push((
+            Label::Text("x5chain".into()),
+            Value::Array(vec![Value::Bytes(vec![4]), Value::Bytes(vec![5])]),
+        ));
+        assert_eq!(sign1.x5chain().unwrap(), vec![&[4][..], &[5][..]]);
+        assert!(sign1.validate_c2pa_claim().is_ok());
+        assert!(sign1.validate_c2pa_claim_for_signing().is_err());
+        sign1
+            .protected
+            .header
+            .rest
+            .push((Label::Int(33), Value::Bytes(vec![6])));
+        assert_eq!(sign1.x5chain().unwrap(), vec![&[6][..]]);
+        assert!(sign1.validate_c2pa_claim_for_signing().is_ok());
+        sign1.protected.header.rest[0].1 = Value::Array(vec![]);
+        assert!(sign1.x5chain().is_err());
+        sign1.protected.header.rest[0].1 = Value::Array(vec![Value::Text("not DER bytes".into())]);
+        assert!(sign1.x5chain().is_err());
+        sign1.protected.header.rest[0] = (Label::Text("x5chain".into()), Value::Bytes(vec![1]));
+        assert!(sign1.x5chain().is_err());
+        sign1.unprotected.rest[0] = (Label::Int(33), Value::Bytes(vec![7]));
+        assert_eq!(sign1.x5chain().unwrap(), vec![&[7][..]]);
+        assert!(sign1.validate_c2pa_claim_for_signing().is_err());
+    }
+
+    #[test]
+    fn c2pa_timestamp_and_ocsp_containers_are_opaque_and_recoverable() {
+        let mut sign1 = claim_signature();
+        assert_eq!(sign1.timestamp_token(TimestampVersion::V1).unwrap(), None);
+        assert_eq!(sign1.timestamp_token(TimestampVersion::V2).unwrap(), None);
+        assert_eq!(sign1.ocsp_responses().unwrap(), None);
+        let token = container("val", Value::Bytes(vec![0x30, 1]));
+        let timestamp = container("tstTokens", Value::Array(vec![token.clone()]));
+        sign1.unprotected = HeaderBuilder::new()
+            .text_value("sigTst2".into(), timestamp.clone())
+            .text_value(
+                "rVals".into(),
+                container(
+                    "ocspVals",
+                    Value::Array(vec![Value::Bytes(vec![1]), Value::Bytes(vec![2])]),
+                ),
+            )
+            .build();
+        assert_eq!(
+            sign1.timestamp_token(TimestampVersion::V2).unwrap(),
+            Some(&[0x30, 1][..])
+        );
+        assert_eq!(
+            sign1.ocsp_responses().unwrap(),
+            Some(vec![&[1][..], &[2][..]])
+        );
+        assert!(sign1.validate_c2pa_claim_for_signing().is_ok());
+        let wire = sign1.to_tagged_vec().unwrap();
+        assert_eq!(
+            CoseSign1::from_tagged_slice(&wire).unwrap(),
+            sign1_with_original(sign1.clone())
+        );
+        sign1
+            .unprotected
+            .rest
+            .push((Label::Text("sigTst".into()), timestamp));
+        assert_eq!(
+            sign1.timestamp_token(TimestampVersion::V1).unwrap(),
+            Some(&[0x30, 1][..])
+        );
+        assert!(sign1.validate_c2pa_claim_for_signing().is_err());
+        sign1.unprotected.rest.pop();
+        for tokens in [
+            vec![],
+            vec![token.clone(), token],
+            vec![container("val", Value::Text("bad".into()))],
+        ] {
+            sign1.unprotected.rest[0].1 = container("tstTokens", Value::Array(tokens));
+            assert!(sign1.timestamp_token(TimestampVersion::V2).is_err());
+            assert!(CoseSign1::from_tagged_slice(&sign1.to_tagged_vec().unwrap()).is_ok());
+        }
+        sign1.unprotected.rest[1].1 = container("ocspVals", Value::Array(vec![]));
+        assert!(sign1.ocsp_responses().is_err());
+    }
+
+    fn sign1_with_original(mut sign1: CoseSign1) -> CoseSign1 {
+        sign1.protected.original_data = Some(sign1.protected.encoded_bytes().unwrap());
+        sign1
+    }
+
+    #[test]
+    fn c2pa_timestamp_payload_preserves_encoded_signature_field() {
+        for signature in [
+            vec![0x41, 0xaa],
+            vec![0x58, 1, 0xaa],
+            vec![0x5f, 0x41, 0xaa, 0xff],
+        ] {
+            for array in [0x84, 0x9f] {
+                let mut wire = vec![0xd2, array, 0x43, 0xa1, 1, 0x26, 0xa0, 0xf6];
+                wire.extend_from_slice(&signature);
+                if array == 0x9f {
+                    wire.push(0xff);
+                }
+                let encoded = CoseSign1::signature_bstr_from_tagged_slice(&wire).unwrap();
+                assert_eq!(encoded, signature);
+                let sign1 = CoseSign1::from_tagged_slice(&wire).unwrap();
+                assert_eq!(sign1.signature_bstr().unwrap(), vec![0x41, 0xaa]);
+                let tbs = sign1.c2pa_timestamp_tbs_data(encoded).unwrap();
+                let decoded: Value = crate::from_slice(&tbs).unwrap();
+                assert_eq!(
+                    decoded,
+                    Value::Array(vec![
+                        Value::Text("CounterSignature".into()),
+                        Value::Bytes(vec![0xa1, 1, 0x26]),
+                        Value::Bytes(vec![]),
+                        Value::Bytes(signature.clone()),
+                    ])
+                );
+                wire.push(0);
+                assert!(CoseSign1::signature_bstr_from_tagged_slice(&wire).is_err());
+            }
+        }
+        let mut sign1 = claim_signature();
+        sign1.signature = vec![0xaa; 256];
+        assert_eq!(&sign1.signature_bstr().unwrap()[..3], &[0x59, 1, 0]);
+        let tbs = sign1.c2pa_timestamp_tbs_data(b"v1 claim").unwrap();
+        let decoded: Value = crate::from_slice(&tbs).unwrap();
+        assert!(
+            matches!(decoded, Value::Array(fields) if fields[3] == Value::Bytes(b"v1 claim".to_vec()))
+        );
+    }
+
+    #[test]
+    fn c2pa_live_video_and_claimed_signing_time_access() {
+        let mut sign1 = CoseSign1Builder::new()
+            .protected(
+                HeaderBuilder::new()
+                    .algorithm(-7)
+                    .text_value("iat".into(), Value::Float(123.5))
+                    .build(),
+            )
+            .unprotected(
+                HeaderBuilder::new()
+                    .value(4, Value::Bytes(b"session".to_vec()))
+                    .build(),
+            )
+            .payload(b"serialized segment-info-map".to_vec())
+            .build();
+        assert!(sign1.c2pa_tbs_data().is_ok());
+        assert!(sign1.validate_c2pa_claim().is_err());
+        assert_eq!(
+            sign1.unprotected.get(&Label::Int(4)),
+            Some(&Value::Bytes(b"session".to_vec()))
+        );
+        for iat in [Value::Integer(-1), Value::Float(123.5)] {
+            sign1.protected.header.rest[0].1 = iat;
+            assert!(sign1.validate_c2pa().is_ok());
+        }
+        for iat in [
+            Value::Tag(1, Box::new(Value::Integer(123))),
+            Value::Text("123".into()),
+            Value::Float(f64::INFINITY),
+        ] {
+            sign1.protected.header.rest[0].1 = iat;
+            assert!(sign1.validate_c2pa().is_err());
+        }
+        sign1.protected.header.rest.clear();
+        sign1
+            .unprotected
+            .rest
+            .push((Label::Text("iat".into()), Value::Integer(123)));
+        assert!(sign1.validate_c2pa().is_err());
+    }
+
+    #[test]
+    fn c2pa_signing_inputs_require_protected_alg_and_empty_aad() {
+        let mut sign1 = CoseSign1::default();
+        assert!(sign1.c2pa_detached_tbs_data(b"claim").is_err());
+        sign1.protected = ProtectedHeader::new(HeaderBuilder::new().algorithm(-7).build());
+        let data = sign1.c2pa_detached_tbs_data(b"claim").unwrap();
+        let decoded: Value = crate::from_slice(&data).unwrap();
+        assert_eq!(
+            decoded,
+            Value::Array(vec![
+                Value::Text("Signature1".into()),
+                Value::Bytes(sign1.protected.encoded_bytes().unwrap()),
+                Value::Bytes(vec![]),
+                Value::Bytes(b"claim".to_vec()),
+            ])
+        );
+        sign1.payload = Some(vec![]);
+        assert!(sign1.c2pa_detached_tbs_data(b"claim").is_err());
+        assert!(sign1.c2pa_tbs_data().is_ok());
+        sign1
+            .unprotected
+            .rest
+            .push((Label::Text("alg".into()), Value::Integer(-7)));
+        assert!(sign1.validate_c2pa().is_err());
+    }
 
     fn sample_header() -> Header {
         HeaderBuilder::new()
