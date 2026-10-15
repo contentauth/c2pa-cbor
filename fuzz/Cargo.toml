@@ -1,8 +1,8 @@
 [package]
-name = "c2pa-cbor-fuzz"
-version = "0.0.0"
 edition = "2021"
+name = "c2pa-cbor-fuzz"
 publish = false
+version = "0.0.0"
 
 [package.metadata]
 cargo-fuzz = true
@@ -11,15 +11,15 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 
 [dependencies.c2pa_cbor]
-path = ".."
 features = ["cose"]
+path = ".."
 
 [[bin]]
+bench = false
+doc = false
 name = "decode"
 path = "fuzz_targets/decode.rs"
 test = false
-doc = false
-bench = false
 
 [workspace]
 members = ["."]
