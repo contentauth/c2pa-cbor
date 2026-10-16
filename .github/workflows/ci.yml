@@ -49,6 +49,9 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Test C2PA COSE interoperability and adversarial decoding
+        run: cargo test --all-features --tests
+
       - name: Generate code coverage
         run: cargo llvm-cov --lib --all-features --lcov --output-path lcov.info
 
