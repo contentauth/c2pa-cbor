@@ -2,7 +2,25 @@
 authors = ["Gavin Peacock <gpeacock@adobe.com>"]
 description = "CBOR encoder/decoder: serde_cbor compatible with support for tagged types."
 edition = "2024"
-exclude = [".github/temp-bin/cargo-udeps"]
+exclude = [
+  ".github/**",
+  "tests/**",
+  "benches/**",
+  "fuzz/**",
+  "Cargo.lock",
+  "CHANGELOG.md",
+  "CODE_OF_CONDUCT.md",
+  "CONTRIBUTING.md",
+  "SECURITY.md",
+  "Makefile",
+  "codecov.yml",
+  "deny.toml",
+  "release-plz.toml",
+  "rustfmt.toml",
+  ".taplo.toml",
+  ".gitignore",
+  ".commitlintrc.yml",
+]
 homepage = "https://contentauthenticity.org"
 keywords = ["cbor", "metadata"]
 license = "MIT OR Apache-2.0"

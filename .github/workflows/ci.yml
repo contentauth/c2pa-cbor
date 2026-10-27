@@ -14,6 +14,11 @@ on:
     branches:
       - main
 
+env:
+  # Line tables keep backtraces useful while cutting compile and link time
+  # relative to full debuginfo.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   tests:
     name: Unit tests
@@ -224,9 +229,17 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the dependency cache even if a test fails, so a red run
+          # doesn't force the next one to rebuild everything.
+          cache-on-failure: true
 
+      # --lib --tests (not --all-targets): benches need criterion/codspeed and
+      # aren't meaningful on the simulator; they're built and run in the
+      # `benchmarks` job. Each test binary is installed and launched on the
+      # simulator separately, so keep the number of binaries small.
       - name: Run unit tests (cross build)
-        run: cargo dinghy -p auto-ios-aarch64-sim -d ${{ env.device }} test --all-targets --all-features
+        run: cargo dinghy -p auto-ios-aarch64-sim -d ${{ env.device }} test --lib --tests --all-features
 
   tests-wasm:
     name: Unit tests (Wasm)
