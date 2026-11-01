@@ -53,8 +53,13 @@ pub enum Value {
     Null,
     /// Boolean value
     Bool(bool),
-    /// Integer value (signed 64-bit)
-    Integer(i64),
+    /// Integer value.
+    ///
+    /// Held as `i128` so it can represent every CBOR integer: unsigned values
+    /// up to `u64::MAX` and negatives down to `-2^64`, neither of which fits in
+    /// `i64`. This matches `serde_cbor`/`ciborium`, whose `Value` integers are
+    /// also `i128`-backed.
+    Integer(i128),
     /// Floating point value
     Float(f64),
     /// Byte string
@@ -77,7 +82,7 @@ impl Serialize for Value {
         match self {
             Value::Null => serializer.serialize_none(),
             Value::Bool(b) => serializer.serialize_bool(*b),
-            Value::Integer(i) => serializer.serialize_i64(*i),
+            Value::Integer(i) => serializer.serialize_i128(*i),
             Value::Float(f) => serializer.serialize_f64(*f),
             Value::Bytes(b) => serializer.serialize_bytes(b),
             Value::Text(s) => serializer.serialize_str(s),
@@ -135,44 +140,58 @@ impl<'de> Deserialize<'de> for Value {
             }
 
             fn visit_i8<E>(self, value: i8) -> Result<Value, E> {
-                Ok(tagged(Value::Integer(value as i64)))
+                Ok(tagged(Value::Integer(value as i128)))
             }
 
             fn visit_i16<E>(self, value: i16) -> Result<Value, E> {
-                Ok(tagged(Value::Integer(value as i64)))
+                Ok(tagged(Value::Integer(value as i128)))
             }
 
             fn visit_i32<E>(self, value: i32) -> Result<Value, E> {
-                Ok(tagged(Value::Integer(value as i64)))
+                Ok(tagged(Value::Integer(value as i128)))
             }
 
             fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+                Ok(tagged(Value::Integer(value as i128)))
+            }
+
+            fn visit_i128<E>(self, value: i128) -> Result<Value, E> {
                 Ok(tagged(Value::Integer(value)))
             }
 
             fn visit_u8<E>(self, value: u8) -> Result<Value, E> {
-                Ok(tagged(Value::Integer(value as i64)))
+                Ok(tagged(Value::Integer(value as i128)))
             }
 
             fn visit_u16<E>(self, value: u16) -> Result<Value, E> {
-                Ok(tagged(Value::Integer(value as i64)))
+                Ok(tagged(Value::Integer(value as i128)))
             }
 
             fn visit_u32<E>(self, value: u32) -> Result<Value, E> {
-                Ok(tagged(Value::Integer(value as i64)))
+                Ok(tagged(Value::Integer(value as i128)))
             }
 
-            fn visit_u64<E>(self, value: u64) -> Result<Value, E>
+            fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+                // Every u64 fits in i128, so this is always representable.
+                Ok(tagged(Value::Integer(value as i128)))
+            }
+
+            fn visit_u128<E>(self, value: u128) -> Result<Value, E>
             where
                 E: de::Error,
             {
                 // Drain the tags before the fallible check below, so they can
                 // never leak into a later, unrelated decode if this errors.
+                // (This crate's own decoder never emits a u128 - CBOR integers
+                // top out at u64 - so this only guards against other
+                // deserializers handing us a value past i128::MAX.)
                 let tags = tags::take_all_tags();
-                if value <= i64::MAX as u64 {
-                    Ok(wrap_tags(Value::Integer(value as i64), tags))
-                } else {
-                    Err(E::custom(format!("u64 value {} too large for i64", value)))
+                match i128::try_from(value) {
+                    Ok(v) => Ok(wrap_tags(Value::Integer(v), tags)),
+                    Err(_) => Err(E::custom(format!(
+                        "u128 value {} too large for i128",
+                        value
+                    ))),
                 }
             }
 
@@ -327,10 +346,22 @@ impl Value {
         }
     }
 
-    /// Returns the value as an integer, if it is one
-    pub fn as_i64(&self) -> Option<i64> {
+    /// Returns the value as an `i128`, if it is an integer
+    pub fn as_i128(&self) -> Option<i128> {
         match self {
             Value::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Returns the value as an `i64`, if it is an integer that fits in `i64`
+    ///
+    /// Returns `None` for non-integers and for integers outside `i64` range
+    /// (unsigned values above `i64::MAX`, or negatives below `i64::MIN`); use
+    /// [`Value::as_i128`] to read those.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Integer(i) => i64::try_from(*i).ok(),
             _ => None,
         }
     }
@@ -522,42 +553,46 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_i8(self, v: i8) -> Result<Value, crate::Error> {
-        Ok(Value::Integer(v as i64))
+        Ok(Value::Integer(v as i128))
     }
 
     fn serialize_i16(self, v: i16) -> Result<Value, crate::Error> {
-        Ok(Value::Integer(v as i64))
+        Ok(Value::Integer(v as i128))
     }
 
     fn serialize_i32(self, v: i32) -> Result<Value, crate::Error> {
-        Ok(Value::Integer(v as i64))
+        Ok(Value::Integer(v as i128))
     }
 
     fn serialize_i64(self, v: i64) -> Result<Value, crate::Error> {
+        Ok(Value::Integer(v as i128))
+    }
+
+    fn serialize_i128(self, v: i128) -> Result<Value, crate::Error> {
         Ok(Value::Integer(v))
     }
 
     fn serialize_u8(self, v: u8) -> Result<Value, crate::Error> {
-        Ok(Value::Integer(v as i64))
+        Ok(Value::Integer(v as i128))
     }
 
     fn serialize_u16(self, v: u16) -> Result<Value, crate::Error> {
-        Ok(Value::Integer(v as i64))
+        Ok(Value::Integer(v as i128))
     }
 
     fn serialize_u32(self, v: u32) -> Result<Value, crate::Error> {
-        Ok(Value::Integer(v as i64))
+        Ok(Value::Integer(v as i128))
     }
 
     fn serialize_u64(self, v: u64) -> Result<Value, crate::Error> {
-        if v <= i64::MAX as u64 {
-            Ok(Value::Integer(v as i64))
-        } else {
-            Err(crate::Error::Encoding(format!(
-                "u64 value {} too large for i64",
-                v
-            )))
-        }
+        // Every u64 fits in i128.
+        Ok(Value::Integer(v as i128))
+    }
+
+    fn serialize_u128(self, v: u128) -> Result<Value, crate::Error> {
+        i128::try_from(v)
+            .map(Value::Integer)
+            .map_err(|_| crate::Error::Encoding(format!("u128 value {} too large for i128", v)))
     }
 
     fn serialize_f32(self, v: f32) -> Result<Value, crate::Error> {
@@ -877,6 +912,49 @@ mod tests {
         let bytes = to_vec(&value).unwrap();
         let decoded: Value = from_slice(&bytes).unwrap();
         assert_eq!(value, decoded);
+    }
+
+    #[test]
+    fn test_value_integer_u64_above_i64_max_round_trips() {
+        // u64::MAX exceeds i64 but fits Value's i128; it must round-trip and
+        // encode as a plain CBOR unsigned integer (major type 0).
+        let value = Value::Integer(u64::MAX as i128);
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(bytes[0], 0x1b); // unsigned, 8-byte payload
+        assert_eq!(from_slice::<Value>(&bytes).unwrap(), value);
+    }
+
+    #[test]
+    fn test_value_integer_min_cbor_negative_round_trips() {
+        // -2^64 is the smallest CBOR negative integer; below i64 but inside i128.
+        let value = Value::Integer(-(1i128 << 64));
+        let bytes = to_vec(&value).unwrap();
+        assert_eq!(
+            bytes,
+            vec![0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+        );
+        assert_eq!(from_slice::<Value>(&bytes).unwrap(), value);
+    }
+
+    #[test]
+    fn test_value_integer_beyond_cbor_range_errors() {
+        // i128 can hold values past CBOR's integer range; encoding those needs
+        // a bignum, which this crate doesn't emit, so it errors rather than
+        // producing something lossy.
+        assert!(to_vec(&Value::Integer(i128::MAX)).is_err());
+        assert!(to_vec(&Value::Integer(i128::MIN)).is_err());
+    }
+
+    #[test]
+    fn test_value_as_i64_out_of_range() {
+        // as_i64 narrows and returns None outside i64; as_i128 always succeeds.
+        let big = Value::Integer(u64::MAX as i128);
+        assert_eq!(big.as_i64(), None);
+        assert_eq!(big.as_i128(), Some(u64::MAX as i128));
+
+        let small = Value::Integer(-5);
+        assert_eq!(small.as_i64(), Some(-5));
+        assert_eq!(small.as_i128(), Some(-5));
     }
 
     #[test]
