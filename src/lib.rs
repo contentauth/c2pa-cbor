@@ -108,7 +108,7 @@ pub use decoder::{
 };
 
 pub mod value;
-pub use value::{Value, from_value, to_value};
+pub use value::{Value, from_value, from_value_with_max_depth, to_value, to_value_with_max_depth};
 
 pub mod tags;
 pub use tags::*;

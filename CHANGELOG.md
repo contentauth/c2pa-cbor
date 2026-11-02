@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+* Bound `to_value` and `from_value` nesting to `DEFAULT_MAX_DEPTH` (128),
+  including map keys, tags, and serialization wrappers. Previously accepted
+  over-limit inputs now return an encoding error.
+* Safely dispose of rejected deep `from_value` inputs using iterative destruction.
+
+### Added
+
+* `to_value_with_max_depth` and `from_value_with_max_depth` for configurable
+  nesting limits, and `Value::drop_iterative` for explicit deep-tree cleanup.
+
 ## [0.78.2](https://github.com/contentauth/c2pa-cbor/compare/v0.78.1...v0.78.2)
 _27 October 2026_
 

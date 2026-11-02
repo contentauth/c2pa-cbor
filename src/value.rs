@@ -274,6 +274,28 @@ impl<'de> Deserialize<'de> for Value {
 }
 
 impl Value {
+    /// Dispose of an owned tree without recursive destruction.
+    ///
+    /// Use this for manually constructed trees that may exceed
+    /// [`crate::DEFAULT_MAX_DEPTH`]. Ordinary Rust destruction of `Value` is
+    /// recursive; borrowing such a tree for [`to_value`] does not dispose of it.
+    pub fn drop_iterative(self) {
+        let mut pending = vec![self];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Array(values) => pending.extend(values),
+                Value::Map(values) => {
+                    for (key, value) in values {
+                        pending.push(key);
+                        pending.push(value);
+                    }
+                }
+                Value::Tag(_, value) => pending.push(*value),
+                _ => {}
+            }
+        }
+    }
+
     /// Returns true if the value is null
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
@@ -492,8 +514,12 @@ impl PartialOrd for Value {
 
 /// Convert a `T` into `Value` which is an enum that can represent any valid CBOR data.
 ///
+/// Uses [`crate::DEFAULT_MAX_DEPTH`]; see [`to_value_with_max_depth`] for depth
+/// semantics and the contract for caller-owned input.
+///
 /// This conversion can fail if `T`'s implementation of `Serialize` decides to
-/// fail, or if `T` contains a map with non-string keys.
+/// fail, if an integer is out of range, or if the nesting limit is exceeded.
+/// Maps may have non-string keys.
 ///
 /// Note: Due to how serde works, `Some(x)` will serialize as just `x`, and `None` as `Null`.
 /// This means you cannot distinguish between `Some(T)` and `T` in the resulting `Value`.
@@ -501,10 +527,76 @@ pub fn to_value<T>(value: T) -> Result<Value, crate::Error>
 where
     T: Serialize,
 {
-    value.serialize(ValueSerializer)
+    to_value_with_max_depth(value, crate::DEFAULT_MAX_DEPTH)
 }
 
-struct ValueSerializer;
+/// Convert a serializable input into a value with a nesting budget.
+///
+/// Each array, map, tag, `Some`, and newtype struct consumes one level.
+/// Externally tagged enum variants consume one level for their map, plus one
+/// for a tuple/struct payload. Map keys and values share the parent's budget;
+/// siblings do not consume each other's budget. Scalars consume no levels, so
+/// a limit of zero accepts scalars but rejects even empty containers.
+///
+/// This bounds recursion through Serde's standard containers and wrappers, not
+/// arbitrary recursion inside user-defined `Serialize` or `Drop` implementations.
+/// In particular, pass deeply nested owned trees by reference and dispose of
+/// them separately (for `Value`, use [`Value::drop_iterative`]). Passing ownership
+/// to this generic function still runs the input's ordinary destructor.
+///
+/// Raising the limit above [`crate::DEFAULT_MAX_DEPTH`] requires enough stack
+/// space for serialization and subsequent use/destruction of the returned tree.
+pub fn to_value_with_max_depth<T>(value: T, max_depth: usize) -> crate::Result<Value>
+where
+    T: Serialize,
+{
+    value.serialize(ValueSerializer {
+        depth: 0,
+        max_depth,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ValueSerializer {
+    depth: usize,
+    max_depth: usize,
+}
+
+impl ValueSerializer {
+    fn child(self) -> crate::Result<Self> {
+        if self.depth >= self.max_depth {
+            return Err(crate::Error::Encoding(format!(
+                "value nesting exceeds maximum depth {}",
+                self.max_depth
+            )));
+        }
+        Ok(Self {
+            depth: self.depth + 1,
+            ..self
+        })
+    }
+
+    fn check_value(self, value: &Value) -> crate::Result<()> {
+        match value {
+            Value::Array(values) => {
+                let child = self.child()?;
+                for value in values {
+                    child.check_value(value)?;
+                }
+            }
+            Value::Map(values) => {
+                let child = self.child()?;
+                for (key, value) in values {
+                    child.check_value(key)?;
+                    child.check_value(value)?;
+                }
+            }
+            Value::Tag(_, value) => self.child()?.check_value(value)?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 impl Serializer for ValueSerializer {
     type Error = crate::Error;
@@ -585,7 +677,7 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Value, crate::Error> {
-        value.serialize(self)
+        value.serialize(self.child()?)
     }
 
     fn serialize_unit(self) -> Result<Value, crate::Error> {
@@ -610,13 +702,14 @@ impl Serializer for ValueSerializer {
         name: &'static str,
         value: &T,
     ) -> Result<Value, crate::Error> {
+        let child = self.child()?;
         // Check if this is the special CBOR tag marker from Tagged<T>/Value::Tag
         if name == tags::TAG_MARKER_NAME
             && let Some(tag) = tags::take_tag()
         {
-            return Ok(Value::Tag(tag, Box::new(value.serialize(self)?)));
+            return Ok(Value::Tag(tag, Box::new(value.serialize(child)?)));
         }
-        value.serialize(self)
+        value.serialize(child)
     }
 
     fn serialize_newtype_variant<T: ?Sized + Serialize>(
@@ -629,13 +722,16 @@ impl Serializer for ValueSerializer {
         let mut map = BTreeMap::new();
         map.insert(
             Value::Text(variant.to_string()),
-            value.serialize(ValueSerializer)?,
+            value.serialize(self.child()?)?,
         );
         Ok(Value::Map(map))
     }
 
     fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, crate::Error> {
-        Ok(SerializeVec { vec: Vec::new() })
+        Ok(SerializeVec {
+            vec: Vec::new(),
+            serializer: self.child()?,
+        })
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, crate::Error> {
@@ -660,6 +756,7 @@ impl Serializer for ValueSerializer {
         Ok(SerializeTupleVariant {
             name: variant.to_string(),
             vec: Vec::new(),
+            serializer: self.child()?.child()?,
         })
     }
 
@@ -667,6 +764,7 @@ impl Serializer for ValueSerializer {
         Ok(SerializeMap {
             map: BTreeMap::new(),
             next_key: None,
+            serializer: self.child()?,
         })
     }
 
@@ -688,12 +786,14 @@ impl Serializer for ValueSerializer {
         Ok(SerializeStructVariant {
             name: variant.to_string(),
             map: BTreeMap::new(),
+            serializer: self.child()?.child()?,
         })
     }
 }
 
 struct SerializeVec {
     vec: Vec<Value>,
+    serializer: ValueSerializer,
 }
 
 impl serde::ser::SerializeSeq for SerializeVec {
@@ -701,7 +801,7 @@ impl serde::ser::SerializeSeq for SerializeVec {
     type Ok = Value;
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
-        self.vec.push(value.serialize(ValueSerializer)?);
+        self.vec.push(value.serialize(self.serializer)?);
         Ok(())
     }
 
@@ -739,6 +839,7 @@ impl serde::ser::SerializeTupleStruct for SerializeVec {
 struct SerializeTupleVariant {
     name: String,
     vec: Vec<Value>,
+    serializer: ValueSerializer,
 }
 
 impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
@@ -746,7 +847,7 @@ impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
     type Ok = Value;
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), crate::Error> {
-        self.vec.push(value.serialize(ValueSerializer)?);
+        self.vec.push(value.serialize(self.serializer)?);
         Ok(())
     }
 
@@ -760,6 +861,7 @@ impl serde::ser::SerializeTupleVariant for SerializeTupleVariant {
 struct SerializeMap {
     map: BTreeMap<Value, Value>,
     next_key: Option<Value>,
+    serializer: ValueSerializer,
 }
 
 impl serde::ser::SerializeMap for SerializeMap {
@@ -767,7 +869,7 @@ impl serde::ser::SerializeMap for SerializeMap {
     type Ok = Value;
 
     fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), crate::Error> {
-        self.next_key = Some(key.serialize(ValueSerializer)?);
+        self.next_key = Some(key.serialize(self.serializer)?);
         Ok(())
     }
 
@@ -775,7 +877,7 @@ impl serde::ser::SerializeMap for SerializeMap {
         let key = self.next_key.take().ok_or_else(|| {
             crate::Error::Encoding("serialize_value called before serialize_key".to_string())
         })?;
-        self.map.insert(key, value.serialize(ValueSerializer)?);
+        self.map.insert(key, value.serialize(self.serializer)?);
         Ok(())
     }
 
@@ -804,6 +906,7 @@ impl serde::ser::SerializeStruct for SerializeMap {
 struct SerializeStructVariant {
     name: String,
     map: BTreeMap<Value, Value>,
+    serializer: ValueSerializer,
 }
 
 impl serde::ser::SerializeStructVariant for SerializeStructVariant {
@@ -817,7 +920,7 @@ impl serde::ser::SerializeStructVariant for SerializeStructVariant {
     ) -> Result<(), crate::Error> {
         self.map.insert(
             Value::Text(key.to_string()),
-            value.serialize(ValueSerializer)?,
+            value.serialize(self.serializer)?,
         );
         Ok(())
     }
@@ -834,12 +937,58 @@ impl serde::ser::SerializeStructVariant for SerializeStructVariant {
 /// This conversion can fail if the structure of the `Value` does not match the
 /// structure expected by `T`, for example if `T` is a struct type but the
 /// `Value` contains something other than a CBOR map.
+///
+/// Uses [`crate::DEFAULT_MAX_DEPTH`]. The input is checked before binary
+/// serialization. Rejected deep inputs are disposed of iteratively.
 pub fn from_value<T>(value: Value) -> Result<T, crate::Error>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let bytes = crate::to_vec(&value)?;
-    crate::from_slice(&bytes)
+    from_value_with_max_depth(value, crate::DEFAULT_MAX_DEPTH)
+}
+
+/// Interpret an owned value as `T`, limiting array, map, and tag nesting.
+///
+/// Scalars consume no levels; a limit of zero rejects containers and tags.
+/// Both map keys and values are checked before encoding. The same limit is
+/// applied to the binary decoder. Until the input has been verified to fit
+/// [`crate::DEFAULT_MAX_DEPTH`], cleanup uses iterative destruction, including
+/// on error or unwinding. Verified inputs use ordinary, depth-bounded destruction.
+///
+/// As with [`to_value_with_max_depth`], a raised limit requires sufficient
+/// stack space. Recursion/destruction in user-defined `Deserialize` types is
+/// outside this guarantee.
+pub fn from_value_with_max_depth<T>(value: Value, max_depth: usize) -> crate::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    struct Input {
+        value: Value,
+        needs_iterative_drop: bool,
+    }
+
+    impl Drop for Input {
+        fn drop(&mut self) {
+            if self.needs_iterative_drop {
+                std::mem::replace(&mut self.value, Value::Null).drop_iterative();
+            }
+        }
+    }
+
+    let mut input = Input {
+        value,
+        needs_iterative_drop: true,
+    };
+    ValueSerializer {
+        depth: 0,
+        max_depth,
+    }
+    .check_value(&input.value)?;
+    input.needs_iterative_drop = max_depth > crate::DEFAULT_MAX_DEPTH;
+    let bytes = crate::to_vec(&input.value)?;
+    crate::Decoder::from_slice(&bytes)
+        .with_max_depth(max_depth)
+        .decode()
 }
 
 #[cfg(test)]

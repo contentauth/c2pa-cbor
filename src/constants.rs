@@ -98,5 +98,7 @@ pub const DEFAULT_MAX_ALLOCATION: usize = 100 * 1024 * 1024; // 100 MB
 
 /// Default maximum recursion depth to prevent stack overflow from deeply nested structures.
 ///
-/// This can be overridden using `Decoder::new(reader).with_max_depth(depth)`.
+/// Used by the decoder and value conversions. Override it using
+/// `Decoder::new(reader).with_max_depth(depth)`,
+/// [`crate::to_value_with_max_depth`], or [`crate::from_value_with_max_depth`].
 pub const DEFAULT_MAX_DEPTH: usize = 128;

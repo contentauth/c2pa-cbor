@@ -296,6 +296,25 @@ fn bench_nested_structures(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_value_conversion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("value_conversion");
+    let structure = TestStruct::sample();
+    group.bench_function("to_value_struct", |b| {
+        b.iter(|| black_box(c2pa_cbor::to_value(black_box(&structure)).unwrap()));
+    });
+    let integers: Vec<i64> = (0..1000).collect();
+    group.bench_function("to_value_1000_ints", |b| {
+        b.iter(|| black_box(c2pa_cbor::to_value(black_box(&integers)).unwrap()));
+    });
+    let value = c2pa_cbor::to_value(&structure).unwrap();
+    group.bench_function("from_value_struct", |b| {
+        b.iter(|| {
+            black_box(c2pa_cbor::from_value::<TestStruct>(black_box(value.clone())).unwrap())
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_byte_arrays,
@@ -303,6 +322,7 @@ criterion_group!(
     bench_collections,
     bench_option_handling,
     bench_flatten,
-    bench_nested_structures
+    bench_nested_structures,
+    bench_value_conversion
 );
 criterion_main!(benches);

@@ -30,6 +30,9 @@ cargo bench --bench cbor_perf -- flatten
 
 # Nested structures
 cargo bench --bench cbor_perf -- nested
+
+# Value conversion (including depth-checking overhead)
+cargo bench --bench cbor_perf -- value_conversion
 ```
 
 ## Benchmark Categories
@@ -79,9 +82,37 @@ Tests 3-level nested structures with vectors at each level to measure recursion 
 
 ## Results Location
 
+The `value_conversion` group measures struct and 1000-integer-array conversion
+to `Value`, and consuming struct conversion from `Value` (including input cloning
+and disposal). To compare revisions, run with `--save-baseline <name>` before
+the change and `--baseline <name>` afterward on the same machine.
+
 Benchmark results are saved to:
 - `target/criterion/` - Detailed HTML reports
 - View reports by opening `target/criterion/report/index.html` in a browser
+
+### Depth-limit comparison (local macOS run, 2026-11-02)
+
+Compared the unbounded implementation against the depth-limited implementation:
+
+```bash
+cargo bench --bench cbor_perf -- value_conversion --save-baseline depth-before
+cargo bench --bench cbor_perf -- value_conversion --baseline depth-before
+```
+
+Both commands passed. Criterion reported:
+
+| Benchmark | Before | After | Reported change |
+|---|---:|---:|---:|
+| `to_value_struct` | 572 ns | 632 ns | +11.0% |
+| `to_value_1000_ints` | 3.57 us | 3.64 us | +0.7%, not statistically significant |
+| `from_value_struct` | 1.55 us | 1.66 us | +7.1% |
+
+These are local microbenchmarks, not SDK whole-object measurements or a
+performance guarantee. Percentages are Criterion's change estimates. Struct
+fixtures include a `HashMap`, whose iteration order can vary between processes.
+Depth checking adds work to value conversions; this change does not modify
+direct binary encoding/decoding or the `Value` integer representation.
 
 ## Performance Expectations
 
